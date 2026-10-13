@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fix metadata for zip 3 by reading JSONs directly via adb exec-out + dd.
+Fix metadata for a problematic Takeout zip by reading JSONs directly via adb exec-out + dd.
 
 The phone's unzip has issues with this particular zip (some entries give
 "Inconsistent information" errors). This script bypasses unzip entirely
@@ -12,8 +12,8 @@ this pushes a shell script to the phone that reads ALL JSONs in one shot,
 reducing 10,000+ ADB calls to just 1.
 """
 
-import json
 import argparse
+import json
 import os
 import struct
 import subprocess
@@ -23,17 +23,23 @@ import time
 import zlib
 from pathlib import Path
 
-REMOTE_ZIP = "/sdcard/Download/takeout-20260310T064252Z-3-003.zip"
+REMOTE_ZIP = None
 OUTPUT_DIR = Path("./Output")
 PROGRESS_FILE = "fix_metadata_progress.json"
-ZIP_NAME = "takeout-20260310T064252Z-3-003.zip"
+ZIP_NAME = None
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from google_takeout_metadata_fixer import (
-    MEDIA_EXTENSIONS, EXIFTOOL_BATCH_SIZE,
-    build_exiftool_args, find_json_match, parse_takeout_json,
-    run_exiftool_batch, is_media, format_time, format_size,
-    load_progress, save_progress,
+from google_takeout_metadata_fixer import (  # noqa: E402
+    EXIFTOOL_BATCH_SIZE,
+    build_exiftool_args,
+    find_json_match,
+    format_size,
+    format_time,
+    is_media,
+    load_progress,
+    parse_takeout_json,
+    run_exiftool_batch,
+    save_progress,
 )
 
 
@@ -214,7 +220,7 @@ def batch_extract_jsons(json_entries):
     ok_count = 0
     fail_count = 0
 
-    for name, local_offset, read_size, method, comp_size in read_specs:
+    for name, _local_offset, read_size, method, comp_size in read_specs:
         if pos + 30 > len(raw_output):
             fail_count += 1
             pos += read_size  # Skip expected bytes
@@ -276,7 +282,7 @@ def parse_args():
     )
     parser.add_argument(
         "--remote-zip",
-        default=REMOTE_ZIP,
+        required=True,
         help="Path to the zip on the Android device.",
     )
     parser.add_argument(
@@ -363,7 +369,7 @@ def main():
     nameset = set(e['name'] for e in all_entries)
 
     # Step 3: Index output files
-    print(f"\nStep 3: Indexing output files...")
+    print("\nStep 3: Indexing output files...")
     output_index = {}
     for f in OUTPUT_DIR.iterdir():
         if f.is_file() and is_media(f.name):

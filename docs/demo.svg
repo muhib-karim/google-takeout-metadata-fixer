@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="690" viewBox="0 0 900 690" role="img" aria-label="Terminal session running google_takeout_metadata_fixer.py on a sample Takeout zip">
+<rect width="900" height="690" rx="10" fill="#0f172a"/>
+<rect width="900" height="34" rx="10" fill="#1e293b"/><rect y="24" width="900" height="10" fill="#1e293b"/>
+<circle cx="20" cy="17" r="6" fill="#f87171"/><circle cx="40" cy="17" r="6" fill="#fbbf24"/><circle cx="60" cy="17" r="6" fill="#4ade80"/>
+<text x="450" y="22" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13" fill="#94a3b8">real output, synthetic sample zip</text>
+<g font-family="Consolas, Menlo, 'DejaVu Sans Mono', monospace" font-size="13" xml:space="preserve">
+<text x="18" y="58" fill="#7dd3fc">$ python google_takeout_metadata_fixer.py --output ./Output --local-zips ./zips</text>
+<text x="18" y="77" fill="#64748b">  ...</text>
+<text x="18" y="96" fill="#e2e8f0">=================================================================</text>
+<text x="18" y="115" fill="#e2e8f0">[1/1] takeout-20260101T000000Z-001.zip</text>
+<text x="18" y="134" fill="#e2e8f0">=================================================================</text>
+<text x="18" y="153" fill="#e2e8f0">  Listing zip contents... 3 media, 3 JSON (0.0s)</text>
+<text x="18" y="172" fill="#e2e8f0">  Streaming JSON metadata... 571.0 B (0.0s)</text>
+<text x="18" y="191" fill="#e2e8f0">  Parsing JSON sidecars... 3/3 parsed (0.0s)</text>
+<text x="18" y="210" fill="#e2e8f0">  Processing 3 media files...</text>
+<text x="18" y="229" fill="#e2e8f0">    [3/3] fixed=0 no_json=0 no_match=0 skip=0 | 5738/s | ETA: 0s</text>
+<text x="18" y="248" fill="#e2e8f0">  DONE: fixed=3 no_json=0 no_match=0 skip=0 err=0 (0s)</text>
+<text x="18" y="267" fill="#e2e8f0"></text>
+<text x="18" y="286" fill="#e2e8f0">=================================================================</text>
+<text x="18" y="305" fill="#e2e8f0">  METADATA FIX COMPLETE (0s)</text>
+<text x="18" y="324" fill="#e2e8f0">=================================================================</text>
+<text x="18" y="343" fill="#e2e8f0">  Files with metadata fixed:  3</text>
+<text x="18" y="362" fill="#e2e8f0">  Already processed (skip):   0</text>
+<text x="18" y="381" fill="#e2e8f0">  No JSON sidecar found:      0</text>
+<text x="18" y="400" fill="#e2e8f0">  No matching output file:    0</text>
+<text x="18" y="419" fill="#e2e8f0">  No usable metadata in JSON: 0</text>
+<text x="18" y="438" fill="#e2e8f0">  Errors:                     0</text>
+<text x="18" y="457" fill="#e2e8f0">  ---</text>
+<text x="18" y="476" fill="#e2e8f0">  With date/time:             3</text>
+<text x="18" y="495" fill="#e2e8f0">  With GPS coordinates:       1</text>
+<text x="18" y="514" fill="#e2e8f0">  With descriptions:          1</text>
+<text x="18" y="533" fill="#e2e8f0">  With people tags:           1</text>
+<text x="18" y="552" fill="#e2e8f0">=================================================================</text>
+<text x="18" y="571" fill="#e2e8f0"></text>
+<text x="18" y="590" fill="#7dd3fc">$ exiftool -DateTimeOriginal -GPSPosition -XMP:PersonInImage Output/IMG_0001.jpg</text>
+<text x="18" y="609" fill="#86efac">Date/Time Original              : 2020:09:13 12:26:40</text>
+<text x="18" y="628" fill="#86efac">GPS Position                    : 48 deg 51' 30.24" N, 2 deg 17' 40.20" E</text>
+<text x="18" y="647" fill="#86efac">Person In Image                 : Alice</text>
+</g>
+</svg>

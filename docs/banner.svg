@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-labelledby="t d">
+  <title id="t">Google Takeout Metadata Fixer</title>
+  <desc id="d">Banner: a JSON sidecar merging its date and GPS metadata into a photo.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="0.55" stop-color="#121a3a"/>
+      <stop offset="1" stop-color="#1b1446"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e3a8a"/>
+      <stop offset="1" stop-color="#7c3aed"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="#a78bfa"/>
+    </marker>
+  </defs>
+
+  <rect width="1280" height="320" fill="url(#bg)"/>
+  <g stroke="#ffffff" stroke-opacity="0.04">
+    <path d="M0 80 H1280 M0 160 H1280 M0 240 H1280"/>
+    <path d="M160 0 V320 M320 0 V320 M480 0 V320 M640 0 V320 M800 0 V320 M960 0 V320 M1120 0 V320"/>
+  </g>
+
+  <!-- Title block -->
+  <g font-family="Segoe UI, Helvetica, Arial, sans-serif">
+    <text x="72" y="138" font-size="54" font-weight="700" fill="#f8fafc">Google Takeout</text>
+    <text x="72" y="198" font-size="54" font-weight="700" fill="url(#accent)">Metadata Fixer</text>
+    <text x="74" y="244" font-size="22" fill="#cbd5e1">Restore dates, GPS, descriptions and people tags from JSON sidecars</text>
+  </g>
+
+  <!-- JSON sidecar card -->
+  <g transform="translate(790 70)">
+    <rect width="170" height="180" rx="14" fill="#0f172a" stroke="#38bdf8" stroke-opacity="0.7" stroke-width="2"/>
+    <g font-family="Consolas, Menlo, monospace" font-size="13">
+      <text x="16" y="30" fill="#38bdf8">.json</text>
+      <text x="16" y="60" fill="#94a3b8">{</text>
+      <text x="28" y="82" fill="#e2e8f0">"photoTaken"</text>
+      <text x="28" y="104" fill="#e2e8f0">"geoData"</text>
+      <text x="28" y="126" fill="#e2e8f0">"people"</text>
+      <text x="28" y="148" fill="#e2e8f0">"description"</text>
+      <text x="16" y="170" fill="#94a3b8">}</text>
+    </g>
+  </g>
+
+  <!-- Merge arrow -->
+  <path d="M970 160 C1000 160, 1010 160, 1036 160" stroke="#a78bfa" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Photo card with embedded metadata -->
+  <g transform="translate(1046 62)">
+    <rect width="168" height="196" rx="14" fill="#f8fafc"/>
+    <rect x="12" y="12" width="144" height="110" rx="8" fill="url(#sky)"/>
+    <circle cx="124" cy="40" r="12" fill="#fde68a"/>
+    <path d="M12 122 L58 70 L88 100 L108 82 L156 122 Z" fill="#0f172a" fill-opacity="0.85"/>
+    <!-- GPS pin -->
+    <path d="M44 60 c-9 0 -15 7 -15 15 c0 11 15 24 15 24 s15 -13 15 -24 c0 -8 -6 -15 -15 -15 z" fill="#f43f5e"/>
+    <circle cx="44" cy="75" r="5" fill="#f8fafc"/>
+    <g font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#334155">
+      <rect x="12" y="134" width="144" height="22" rx="11" fill="#e0f2fe"/>
+      <text x="24" y="149">DateTimeOriginal</text>
+      <rect x="12" y="162" width="144" height="22" rx="11" fill="#ede9fe"/>
+      <text x="24" y="177">GPS · PersonInImage</text>
+    </g>
+  </g>
+</svg>

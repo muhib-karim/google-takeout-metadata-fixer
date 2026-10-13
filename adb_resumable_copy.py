@@ -173,7 +173,7 @@ def main():
     print(f"  Skipped: {skipped_count} (already on phone)", flush=True)
     print(f"  Failed:  {len(failed)}", flush=True)
     if failed:
-        print(f"  Run this script again to retry failed files.", flush=True)
+        print("  Run this script again to retry failed files.", flush=True)
     print(f"{'=' * 60}", flush=True)
 
 

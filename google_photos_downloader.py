@@ -3,9 +3,7 @@ Google Photos Downloader
 Downloads all photos and videos from your Google Photos library.
 """
 
-import json
 import os
-import sys
 import time
 from pathlib import Path
 
@@ -154,7 +152,7 @@ def main():
         # Small delay to avoid rate limiting
         time.sleep(0.5)
 
-    print(f"\n=== Done ===")
+    print("\n=== Done ===")
     print(f"Downloaded: {total_downloaded}")
     print(f"Skipped (already existed): {total_skipped}")
     print(f"Errors: {total_errors}")

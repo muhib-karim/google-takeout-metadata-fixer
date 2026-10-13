@@ -54,7 +54,7 @@ def load_progress():
 
 
 def save_progress(progress):
-    for attempt in range(5):
+    for _attempt in range(5):
         try:
             tmp = PROGRESS_FILE + ".tmp"
             with open(tmp, "w") as f:
@@ -76,7 +76,7 @@ def save_progress(progress):
 
 def find_json_in_zip(nameset, media_entry):
     """Find the JSON sidecar for a media file within a zip's namelist.
-    
+
     Google Takeout uses 'supplemental-metadata' naming which gets truncated
     when filenames are long. Also handles Google's duplicate naming where
     file(2).jpg maps to file.jpg.supplemental-metadata(2).json
@@ -352,7 +352,6 @@ def adb_pull(remote_path, local_path):
 
     # Monitor file size growth for progress
     local_file = Path(local_path)
-    last_print = start
     while proc.poll() is None:
         time.sleep(2)
         if local_file.exists():
@@ -533,7 +532,7 @@ def main():
     if args.adb:
         # ==================== ADB MODE ====================
         check_adb()
-        print(f"=== ADB Mode ===")
+        print("=== ADB Mode ===")
         print(f"Source:  phone:{args.source}")
         print(f"Output:  {output_dir.resolve()}\n")
 
@@ -561,7 +560,7 @@ def main():
         disk = _shutil.disk_usage(str(output_dir.resolve()))
         print(f"\nDisk free: {format_size(disk.free)}")
         print(f"Largest zip: {format_size(max(zip_sizes.values()))}")
-        print(f"Needed per cycle: largest zip + output files\n")
+        print("Needed per cycle: largest zip + output files\n")
 
         overall_start = time.time()
         temp_zip_dir = Path(TEMP_ZIP_DIR)
@@ -622,7 +621,7 @@ def main():
             print(f"No zip files found in {args.source}")
             sys.exit(1)
 
-        print(f"=== Direct Mode ===")
+        print("=== Direct Mode ===")
         print(f"Source:  {source_dir.resolve()}")
         print(f"Output:  {output_dir.resolve()}")
         print(f"Zips:    {len(zip_files)}\n")
@@ -642,7 +641,7 @@ def main():
 
     total_files = len(progress.get("processed_files", {}))
     total_zips = len(progress.get("completed_zips", []))
-    print(f"\n=== All Done ===")
+    print("\n=== All Done ===")
     print(f"Processed {total_files} media files from {total_zips} zips")
     print(f"Output: {output_dir.resolve()}")
 

@@ -101,7 +101,7 @@ def load_progress():
 
 
 def save_progress(progress):
-    for attempt in range(5):
+    for _attempt in range(5):
         try:
             tmp = PROGRESS_FILE + ".tmp"
             with open(tmp, "w") as f:
@@ -172,7 +172,11 @@ def find_json_match(nameset, media_entry, json_title_index=None):
         if (name.startswith(prefix_dot) and name.endswith(".json")
                 and name != f"{media_entry}.json"):  # don't match old format yet
             inner = name[len(prefix_dot):-5]  # between "photo.jpg." and ".json"
-            if inner and ".supplemental-metadata"[:len(inner)] == inner.lower():
+            # prefix_dot already consumed the dot, so compare without it
+            # ("s", "su", ...); also accept a leftover dot ("..json")
+            inner = inner.lower()
+            if inner and ("supplemental-metadata".startswith(inner)
+                          or ".supplemental-metadata".startswith(inner)):
                 return name
 
     # --- Rule 4: Google duplicate files ---
@@ -522,40 +526,34 @@ def parse_concatenated_jsons(raw_bytes, json_names_ordered):
     """
     text = raw_bytes.decode("utf-8", errors="replace")
 
-    # Split by finding balanced top-level braces
-    objects = []
-    depth = 0
-    start = None
-    for i, ch in enumerate(text):
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0 and start is not None:
-                objects.append(text[start : i + 1])
-                start = None
+    # Decode consecutive top-level JSON objects. raw_decode understands string
+    # literals, so braces inside descriptions/titles don't break the split.
+    decoder = json.JSONDecoder()
+    parsed_list = []
+    pos = 0
+    while True:
+        start = text.find("{", pos)
+        if start < 0:
+            break
+        try:
+            obj, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            # Skip the unparseable object and resync at the next brace
+            parsed_list.append(None)
+            pos = start + 1
+            continue
+        parsed_list.append(obj if isinstance(obj, dict) else None)
+        pos = end
 
     result = {}
     # If counts match, pair by order (fastest case)
-    if len(objects) == len(json_names_ordered):
-        for name, raw_json in zip(json_names_ordered, objects):
-            try:
-                result[name] = json.loads(raw_json)
-            except json.JSONDecodeError:
-                pass
+    if len(parsed_list) == len(json_names_ordered):
+        for name, obj in zip(json_names_ordered, parsed_list):
+            if obj is not None:
+                result[name] = obj
     else:
-        # Counts don't match — parse what we can and match by title field
-        parsed_list = []
-        for raw_json in objects:
-            try:
-                parsed_list.append(json.loads(raw_json))
-            except json.JSONDecodeError:
-                parsed_list.append(None)
-
         # If close in count, still pair sequentially (some might be metadata.json etc.)
-        if abs(len(objects) - len(json_names_ordered)) <= len(json_names_ordered) * 0.05:
+        if abs(len(parsed_list) - len(json_names_ordered)) <= len(json_names_ordered) * 0.05:
             for i, name in enumerate(json_names_ordered):
                 if i < len(parsed_list) and parsed_list[i]:
                     result[name] = parsed_list[i]
@@ -885,7 +883,7 @@ def main():
         if fallback_singles:
             print(f"  Fetching {len(fallback_singles)} individual JSONs (fallback)...")
             fb_batch = []
-            for media_entry, json_entry, target, entry_key in fallback_singles:
+            for _media_entry, json_entry, target, entry_key in fallback_singles:
                 if use_local:
                     raw = local_stream_single_json(zip_source, json_entry)
                 else:
@@ -932,10 +930,12 @@ def main():
                 for _, _, ek in fb_batch:
                     processed_set.add(ek)
 
-        # Save progress
-        progress["processed_entries"] = list(processed_set)
-        progress.setdefault("completed_zips", []).append(zip_name)
-        save_progress(progress)
+        # Save progress (never during a dry run, otherwise a later real run
+        # would skip every entry the dry run "processed")
+        if not args.dry_run:
+            progress["processed_entries"] = list(processed_set)
+            progress.setdefault("completed_zips", []).append(zip_name)
+            save_progress(progress)
 
         elapsed = time.time() - zip_start
         stats["fixed"] += zip_stats["fixed"]
@@ -963,7 +963,7 @@ def main():
     print(f"  No matching output file:    {stats['no_output_match']}")
     print(f"  No usable metadata in JSON: {stats['no_metadata']}")
     print(f"  Errors:                     {stats['errors']}")
-    print(f"  ---")
+    print("  ---")
     print(f"  With date/time:             {stats['has_datetime']}")
     print(f"  With GPS coordinates:       {stats['has_gps']}")
     print(f"  With descriptions:          {stats['has_description']}")
