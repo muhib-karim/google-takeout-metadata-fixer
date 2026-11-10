@@ -42,6 +42,8 @@ Usage:
     python google_takeout_metadata_fixer.py --output ./Output --local-zips ./zips/ --dry-run
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -49,8 +51,10 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -386,52 +390,131 @@ def build_exiftool_args(metadata, filepath):
     return args
 
 
-def run_exiftool_batch(file_args_list):
-    """Run exiftool on a batch of files using -@ argfile for speed.
+class ExifResult(NamedTuple):
+    """Outcome of one file in an ExifTool batch."""
 
-    Writes all arguments to a temporary argfile and runs exiftool once.
-    Each file gets -overwrite_original to prevent backup file creation.
+    ok: bool
+    message: str = ""
 
-    file_args_list: list of (filepath, [arg1, arg2, ...])
-    Returns: (success_count, error_count)
+
+# Options applied to every file in a batch.
+#   -m                        ignore minor warnings
+#   -overwrite_original       do not leave "_original" backup copies
+#   -charset filename=utf8    file names in the argfile are UTF-8 (needed on Windows)
+#   -api LargeFileSupport=1   allow videos over 4 GiB on older ExifTool releases
+EXIFTOOL_COMMON_ARGS = ["-m", "-overwrite_original", "-charset", "filename=utf8", "-api", "LargeFileSupport=1"]
+EXIFTOOL_TIMEOUT = 600  # seconds per batch
+
+_MARKER = re.compile(r"\{gtmf:(\d+)(?::(\d+|\$\{status\}))?\}")
+
+
+def _argfile_line(arg: str) -> str:
+    """Encode one argument as a single ExifTool argfile line.
+
+    An argfile holds one argument per line, so a value containing a line break (a
+    multi-line caption, for example) would otherwise be split into several arguments,
+    and its later lines would be read as file names or options. The ``#[CSTR]`` prefix
+    makes ExifTool decode backslash escapes, which lets the whole value stay on one line.
+    It also protects values that start with "#" (a comment) or with white space.
     """
-    if not file_args_list:
-        return 0, 0
-
-    import tempfile
-    # Build argfile: one argument per line, groups separated by -execute
-    argfile = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".args", delete=False, encoding="utf-8"
+    escaped = (
+        arg.replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+        .replace("\x00", "")
     )
-    try:
-        for i, (filepath, args) in enumerate(file_args_list):
-            argfile.write("-m\n")
-            argfile.write("-overwrite_original\n")
-            for a in args:
-                argfile.write(a + "\n")
-            argfile.write(str(filepath) + "\n")
-            if i < len(file_args_list) - 1:
-                argfile.write("-execute\n")
-        argfile.close()
+    return "#[CSTR]" + escaped
 
-        result = subprocess.run(
-            ["exiftool", "-@", argfile.name],
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=600
+
+def _split_on_markers(text: str) -> dict[int, tuple[str, str | None]]:
+    """Map block number -> (text printed for that block, status field of its marker)."""
+    blocks: dict[int, tuple[str, str | None]] = {}
+    position = 0
+    for match in _MARKER.finditer(text):
+        blocks[int(match.group(1))] = (text[position:match.start()], match.group(2))
+        position = match.end()
+    return blocks
+
+
+def _parse_exiftool_output(stdout: str, stderr: str, count: int) -> list[ExifResult | None]:
+    """Turn the marker-delimited ExifTool output into one result per file.
+
+    A file whose marker is missing gets ``None``: ExifTool never reported on it
+    (it crashed, was killed or timed out first), so nothing is known about that file.
+    """
+    out_blocks = _split_on_markers(stdout)
+    err_blocks = _split_on_markers(stderr)
+    results: list[ExifResult | None] = []
+    for i in range(count):
+        if i not in out_blocks:
+            results.append(None)
+            continue
+        text, status = out_blocks[i]
+        if status is not None and status.isdigit():
+            ok = status == "0"
+        else:
+            # ExifTool releases without ${status} support print the marker literally;
+            # fall back to the summary line of the block.
+            ok = "1 image files updated" in text and "weren't updated" not in text
+        message = ""
+        if not ok:
+            lines = [line.strip() for line in err_blocks.get(i, ("", None))[0].splitlines() if line.strip()]
+            errors = [line for line in lines if line.startswith("Error")]
+            message = (errors or lines or ["ExifTool reported an error"])[0][:300]
+        results.append(ExifResult(ok, message))
+    return results
+
+
+def run_exiftool_batch_detailed(
+    file_args_list: Sequence[tuple[str | os.PathLike[str], Sequence[str]]],
+) -> list[ExifResult | None]:
+    """Run ExifTool once for a batch of files and report the outcome of each file.
+
+    file_args_list: sequence of (filepath, [arg1, arg2, ...]).
+    Returns one entry per input file, in order: an ``ExifResult``, or ``None`` when
+    ExifTool gave no result for that file (not installed, timed out, crashed).
+
+    The arguments are sent on standard input as an argfile, one ``-execute`` block per
+    file. Every block ends with a marker carrying ExifTool's exit status for that block,
+    which is how results are attributed to individual files.
+    """
+    count = len(file_args_list)
+    if count == 0:
+        return []
+
+    lines: list[str] = []
+    for i, (filepath, args) in enumerate(file_args_list):
+        if i:
+            lines.append("-execute")
+        lines.extend(_argfile_line(a) for a in args)
+        # Absolute path: a relative name starting with "-" would be read as an option.
+        lines.append(_argfile_line(os.path.abspath(os.fspath(filepath))))
+        lines.extend(["-echo3", f"{{gtmf:{i}:${{status}}}}", "-echo4", f"{{gtmf:{i}}}"])
+    payload = ("\n".join(lines) + "\n").encode("utf-8", "surrogateescape")
+
+    try:
+        proc = subprocess.run(
+            ["exiftool", "-@", "-", "-common_args", *EXIFTOOL_COMMON_ARGS],
+            input=payload, capture_output=True, timeout=EXIFTOOL_TIMEOUT,
         )
-        output = result.stdout + result.stderr
-        updated = output.count("1 image files updated")
-        errors = output.count("0 image files updated")
-        return updated, errors
-    except subprocess.TimeoutExpired:
-        return 0, len(file_args_list)
-    except Exception:
-        return 0, len(file_args_list)
-    finally:
-        try:
-            os.unlink(argfile.name)
-        except OSError:
-            pass
+    except (subprocess.TimeoutExpired, OSError):
+        return [None] * count
+    return _parse_exiftool_output(
+        proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace"), count
+    )
+
+
+def run_exiftool_batch(
+    file_args_list: Sequence[tuple[str | os.PathLike[str], Sequence[str]]],
+) -> tuple[int, int]:
+    """Run ExifTool on a batch of files. Returns (updated_count, not_updated_count).
+
+    Thin wrapper around :func:`run_exiftool_batch_detailed` for callers that only need totals.
+    """
+    results = run_exiftool_batch_detailed(file_args_list)
+    updated = sum(1 for r in results if r is not None and r.ok)
+    return updated, len(results) - updated
 
 
 # ---------------------------------------------------------------------------
