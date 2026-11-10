@@ -34,7 +34,7 @@ def test_find_eocd_and_parse_central_directory_roundtrip():
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         infos = zf.infolist()
     assert [e["name"] for e in entries] == [i.filename for i in infos]
-    for entry, info in zip(entries, infos):
+    for entry, info in zip(entries, infos, strict=True):
         assert entry["local_offset"] == info.header_offset
         assert entry["comp_size"] == info.compress_size
         assert entry["uncomp_size"] == info.file_size

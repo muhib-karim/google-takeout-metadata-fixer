@@ -495,9 +495,9 @@ def _resolve_directory(directory: _Directory) -> dict[str, str | None]:
         if media in resolved:
             continue
         for name in _derived_names(media):
-            candidates = [side for tier, _, side in _strict_candidates(directory, name) if tier <= _PLAIN]
-            if candidates:
-                resolved[media] = candidates[0]
+            shared = [side for tier, _, side in _strict_candidates(directory, name) if tier <= _PLAIN]
+            if shared:
+                resolved[media] = shared[0]
                 break
 
     # 4. Titles: a sidecar nobody matched whose JSON title is this file's name.
@@ -571,12 +571,14 @@ def find_json_match(
     global _last_index
     if isinstance(nameset, SidecarIndex):
         index = nameset
-    elif _last_index is not None and _last_index[0] is nameset and _last_index[1] == len(nameset):  # type: ignore[arg-type]
-        index = _last_index[2]
+    elif isinstance(nameset, (set, frozenset, list, tuple)):
+        if _last_index is not None and _last_index[0] is nameset and _last_index[1] == len(nameset):
+            index = _last_index[2]
+        else:
+            index = SidecarIndex(nameset)
+            _last_index = (nameset, len(nameset), index)
     else:
         index = SidecarIndex(nameset)
-        if isinstance(nameset, (set, frozenset, list, tuple)):
-            _last_index = (nameset, len(nameset), index)
     return index.match(media_entry, json_title_index)
 
 
@@ -999,7 +1001,7 @@ def apply_metadata_batch(
         )
         plans.append((build_exiftool_args(metadata, path, write_dates=not keep), keep))
 
-    to_run = [(path, args) for (path, _), (args, _) in zip(items, plans) if args]
+    to_run = [(path, args) for (path, _), (args, _) in zip(items, plans, strict=True) if args]
     results = iter(run_exiftool_batch_detailed(to_run))
     outcome: list[ApplyResult] = []
     for args, keep in plans:
@@ -1320,7 +1322,7 @@ def pair_json_stream(
     values = _decode_json_values(raw_bytes)
     if values is None or len(values) != len(sized_names):
         return {}, "none"
-    for (_, name), value in zip(sized_names, values):
+    for (_, name), value in zip(sized_names, values, strict=True):
         if not isinstance(value, dict):
             continue
         if _looks_like_wrong_sidecar(name, value):
@@ -1362,7 +1364,7 @@ def parse_concatenated_jsons(raw_bytes: bytes, json_names_ordered: Sequence[str]
 
     if len(parsed_list) != len(json_names_ordered):
         return {}
-    return {name: obj for name, obj in zip(json_names_ordered, parsed_list) if obj is not None}
+    return {name: obj for name, obj in zip(json_names_ordered, parsed_list, strict=True) if obj is not None}
 
 
 # ---------------------------------------------------------------------------
@@ -1454,7 +1456,7 @@ def _apply_batch(
     results = apply_metadata_batch(
         [(target, metadata) for target, metadata, _ in batch], overwrite_dates=options.overwrite_dates
     )
-    for (target, _, entry_key), result in zip(batch, results):
+    for (target, _, entry_key), result in zip(batch, results, strict=True):
         if result.status in ("written", "kept"):
             zip_stats["fixed" if result.status == "written" else "unchanged"] += 1
             store.record(entry_key, "done", target=target.name)

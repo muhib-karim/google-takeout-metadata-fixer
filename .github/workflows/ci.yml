@@ -5,35 +5,104 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Mondays 05:17 UTC. A scheduled run notices runner-image and dependency changes
+    # without waiting for the next pull request.
+    - cron: "17 5 * * 1"
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+# Actions are pinned to full commit SHAs (the comment gives the release).
+# Dependabot keeps them up to date. The runner image is pinned as well, so the
+# set of installable Python versions does not change underneath the matrix.
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    name: Lint and type check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: "3.12"
-      - run: pip install "ruff>=0.6"
-      - run: ruff check .
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Install development dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Ruff
+        run: ruff check .
+      - name: Mypy
+        run: mypy
 
   test:
-    runs-on: ubuntu-latest
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+    env:
+      # Fail instead of silently skipping the end-to-end tests if ExifTool is missing
+      GTMF_REQUIRE_EXIFTOOL: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
       - name: Install ExifTool
-        run: sudo apt-get update && sudo apt-get install -y libimage-exiftool-perl
-      - name: Install Python dependencies
-        run: pip install -r requirements-dev.txt
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libimage-exiftool-perl
+      - name: Install development dependencies
+        run: python -m pip install -r requirements-dev.txt
       - name: Run tests
         run: python -m pytest -v
+
+  gitleaks:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # scan the whole history, not just the last commit
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Install development dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Audit runtime and development requirements
+        run: pip-audit -r requirements-dev.txt

@@ -199,11 +199,11 @@ def batch_extract_jsons(json_entries):
     # Run the script — this is the ONE big ADB call
     print("  Running batch extraction (single ADB call for all JSONs)...")
     t0 = time.time()
-    r = subprocess.run(
+    extraction = subprocess.run(
         ["adb", "exec-out", f"sh {remote_script}"],
         capture_output=True, timeout=3600,  # 1 hour max
     )
-    raw_output = r.stdout
+    raw_output = extraction.stdout
     elapsed = time.time() - t0
     print(f"  Got {format_size(len(raw_output))} in {format_time(elapsed)}")
 
@@ -276,7 +276,7 @@ def batch_extract_jsons(json_entries):
 def _apply(batch, stats, processed_set):
     """Write one batch of (target, metadata, entry_key) and update the counters."""
     results = apply_metadata_batch([(target, metadata) for target, metadata, _ in batch])
-    for (_, _, entry_key), result in zip(batch, results):
+    for (_, _, entry_key), result in zip(batch, results, strict=True):
         if result.status in ("written", "kept"):
             stats['fixed'] += 1
         else:
@@ -380,7 +380,7 @@ def main():
 
     # Step 3: Index output files
     print("\nStep 3: Indexing output files...")
-    output_index = {}
+    output_index: dict[str, list[Path]] = {}
     for f in OUTPUT_DIR.iterdir():
         if f.is_file() and is_media(f.name):
             output_index.setdefault(f.name, []).append(f)

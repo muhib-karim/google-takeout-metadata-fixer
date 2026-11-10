@@ -12,12 +12,15 @@ import shlex
 import shutil
 import subprocess
 import zipfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 
 class FakeAdb:
-    def __init__(self, zips: dict[str, Path], *, devices: str = "SYNTH0001\tdevice", crlf: bool = False) -> None:
+    def __init__(
+        self, zips: Mapping[str, Path | str], *, devices: str = "SYNTH0001\tdevice", crlf: bool = False
+    ) -> None:
         self.zips = {remote: Path(local) for remote, local in zips.items()}
         self.devices = devices
         self.crlf = crlf

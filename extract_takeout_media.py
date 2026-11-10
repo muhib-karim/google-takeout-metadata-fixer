@@ -48,7 +48,7 @@ def is_media(name):
 
 def load_progress():
     if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE, "r") as f:
+        with open(PROGRESS_FILE) as f:
             return json.load(f)
     return {"completed_zips": [], "processed_files": {}}
 
