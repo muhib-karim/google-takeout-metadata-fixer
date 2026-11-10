@@ -6,8 +6,8 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/github/license/muhib-karim/google-takeout-metadata-fixer" alt="License: MIT"></a>
-  <img src="https://img.shields.io/github/languages/top/muhib-karim/google-takeout-metadata-fixer" alt="Top language">
   <a href="https://github.com/muhib-karim/google-takeout-metadata-fixer/actions/workflows/ci.yml"><img src="https://github.com/muhib-karim/google-takeout-metadata-fixer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/python-3.10%20%E2%80%93%203.15-blue" alt="Python 3.10 to 3.15">
 </p>
 
 ---
@@ -20,23 +20,25 @@ This project is a set of Python command-line tools. They read the sidecars strai
 
 ## Key features
 
-- **Layered sidecar matching** (`find_json_match`) for the naming patterns Takeout produces:
-  - the newer `photo.jpg.supplemental-metadata.json` format, including duplicate indexes `…(1).json`
-  - truncated sidecar names (`.supplemental-metad.json`, `.supple.json`, `.s.json`)
-  - Google duplicates: `photo(2).jpg` → `photo.jpg.supplemental-metadata(2).json`
-  - older formats: `photo.jpg.json`, `photo.json`, `photo.jpg(1).json`
-  - edited copies: 12 localized suffixes (`-edited`, `-bearbeitet`, `-modifié`, `-editado`, `-modificato`, `-bewerkt`, `-edytowany`, `-redigerad`, `-muokattu`, `-düzenlendi`, `-отредактировано`, `-編集済み`)
-  - live photos: `IMG.mp4` / `IMG.mov` inherit the still image's sidecar
-  - fallback to the sidecar's JSON `title` field
-- **Embedded metadata, not just file timestamps:** `DateTimeOriginal`, `CreateDate`, `ModifyDate`, GPS lat/long/altitude with N/S/E/W refs, `ImageDescription` and `XMP:PersonInImage`. Videos also get `TrackCreateDate`, `TrackModifyDate`, `MediaCreateDate` and `MediaModifyDate`.
+- **Sidecar matching per album folder** (`SidecarIndex`) for the naming patterns Takeout produces:
+  - the newer `photo.jpg.supplemental-metadata.json` format
+  - sidecar names cut short at any point (`.supplemental-metad.json`, `.s.json`, `photo.jpg..json`), including cuts inside a long media name
+  - Google duplicates, where the index must agree: `photo(2).jpg` → `photo.jpg.supplemental-metadata(2).json`, or `photo.jpg(2).json` in older exports
+  - older formats: `photo.jpg.json`, `photo.json`
+  - edited copies: 12 localized suffixes (`-edited`, `-bearbeitet`, `-modifié`, `-editado`, `-modificato`, `-bewerkt`, `-edytowany`, `-redigerad`, `-muokattu`, `-düzenlendi`, `-отредактировано`, `-編集済み`), also combined with a duplicate index
+  - live photos: `IMG.mp4` / `IMG.mov` use the still image's sidecar
+  - the sidecar's JSON `title` field, within the same folder, when names alone cannot decide
+- **Embedded metadata, not just file timestamps:** `DateTimeOriginal`, `CreateDate`, `ModifyDate` with an explicit UTC offset, GPS latitude/longitude/altitude, `ImageDescription` and `XMP:PersonInImage`. Videos also get `TrackCreateDate`, `TrackModifyDate`, `MediaCreateDate` and `MediaModifyDate`.
+- **Keeps what the camera recorded:** if a photo already holds a capture time that is the sidecar's instant in another time zone, it is left alone. `--overwrite-dates` forces the sidecar date.
 - **Two sources:** local zip files, or zips left on an Android phone and streamed over ADB (only the JSON sidecars are read, so no local copy of the archives is needed).
-- **Batched ExifTool calls:** 50 files per invocation through an `-@` argfile.
-- **Resumable:** a progress file records completed zips and entries, so an interrupted run picks up where it stopped. `--dry-run` previews the work without touching files or progress.
+- **Batched ExifTool calls:** 50 files per invocation, with a result for each file.
+- **Resumable and honest about it:** every finished file is journaled as it happens, so an interrupted run continues where it stopped. A file ExifTool could not write is listed and retried with `--retry-failed`; a zip is only marked done when every entry has an outcome. `--dry-run` previews the work without touching files or progress.
+- **Careful with untrusted input:** sidecar text is escaped before it reaches ExifTool, so a caption cannot be read as a command-line option.
 - **Recovery path** (`recover_takeout_zip_metadata.py`): for zips whose on-device `unzip` listing is broken, it parses the zip central directory (including Zip64) from raw bytes read over `adb exec-out` + `dd`.
 
 ## Demo
 
-A real run of the fixer on a small synthetic Takeout zip (3 tiny JPEGs: a normal sidecar, a Google `(1)` duplicate and an `-edited` copy with a truncated sidecar), followed by an ExifTool check:
+A run of the fixer on a small synthetic Takeout zip (3 tiny JPEGs: a normal sidecar, a Google `(1)` duplicate and an `-edited` copy with a truncated sidecar), followed by an ExifTool check. The capture is from version 1.0; the current version prints a few more summary lines.
 
 <p align="center">
   <img src="docs/demo.svg" alt="Terminal output of google_takeout_metadata_fixer.py fixing 3 files and exiftool showing the restored date, GPS and person tag" width="760">
@@ -44,19 +46,26 @@ A real run of the fixer on a small synthetic Takeout zip (3 tiny JPEGs: a normal
 
 ## Quick start
 
-### Requirements
-
-- Python 3.9+ (CI tests 3.9, 3.11 and 3.12)
-- [ExifTool](https://exiftool.org/install.html) on your `PATH` (`sudo apt install libimage-exiftool-perl`, `brew install exiftool`, or the Windows executable)
-- [ADB](https://developer.android.com/tools/releases/platform-tools) on your `PATH`, only for the phone modes
-
 ```bash
 git clone https://github.com/muhib-karim/google-takeout-metadata-fixer.git
 cd google-takeout-metadata-fixer
-pip install -r requirements.txt   # only needed for the optional google_photos_downloader.py
+python google_takeout_metadata_fixer.py --output ./Output --local-zips ./takeout-zips --dry-run
 ```
 
-The metadata fixer, extractor, copy helper and recovery helper use only the Python standard library.
+Drop `--dry-run` to write the metadata. Nothing needs to be installed with pip: the fixer, extractor, copy helper and recovery helper use only the Python standard library.
+
+### Requirements
+
+- Python 3.10 or newer (CI tests 3.10 to 3.15)
+- [ExifTool](https://exiftool.org/install.html) on your `PATH` (`sudo apt install libimage-exiftool-perl`, `brew install exiftool`, or the Windows executable)
+- [ADB](https://developer.android.com/tools/releases/platform-tools) on your `PATH`, only for the phone modes
+- `pip install -r requirements.txt`, only for the optional `google_photos_downloader.py`
+
+### Privacy
+
+Your photos and their metadata stay on your machine. The fixer, extractor, copy helper and recovery helper make no network connections: they read local files, run ExifTool locally, and talk to a phone you attached over USB through ADB. There is no telemetry.
+
+The one exception is the optional `google_photos_downloader.py`, which by design contacts Google's Photos API with an OAuth client you create yourself.
 
 ## Usage
 
@@ -74,6 +83,14 @@ python google_takeout_metadata_fixer.py --output ./Output --phone-dir /sdcard/Do
 # Preview without modifying files or saving progress
 python google_takeout_metadata_fixer.py --output ./Output --local-zips ./takeout-zips --dry-run
 ```
+
+| Option | Effect |
+|---|---|
+| `--dry-run` | Show what would be done; no file and no progress is written |
+| `--overwrite-dates` | Always write the sidecar date, even over a consistent camera time |
+| `--retry-failed` | Try again the files ExifTool reported an error for in an earlier run |
+
+Progress is kept in `fix_metadata_progress.json` in the directory you run the command from, so run it from the same place to resume. Delete that file to start over.
 
 ### 2. Extract media and apply metadata in one pass
 
@@ -112,21 +129,20 @@ flowchart LR
         L[Local Takeout zips]
         P[Zips on Android phone]
     end
-    L -- zipfile --> LS[List entries and<br/>read JSON sidecars]
-    P -- "adb shell unzip -l / unzip -p" --> LS
+    L -- "zipfile, by entry name" --> LS[Listing and<br/>JSON sidecars]
+    P -- "adb shell unzip -l / unzip -p<br/>stream cut at listed sizes" --> LS
     P -- "adb exec-out dd<br/>(recover_takeout_zip_metadata.py)" --> CD[Raw central-directory<br/>parser, Zip64 aware]
     CD --> LS
-    LS --> PJ[parse_concatenated_jsons]
-    PJ --> M[find_json_match<br/>layered naming rules]
-    O[("Extracted media<br/>--output folder")] --> M
-    M --> PT[parse_takeout_json]
-    PT --> B[build_exiftool_args]
-    B --> E[run_exiftool_batch<br/>50 files per -@ argfile]
-    E --> O
-    E --> PR[("fix_metadata_progress.json<br/>resume state")]
+    LS --> M[SidecarIndex<br/>match per folder]
+    M --> PT[parse_takeout_json<br/>validates every field]
+    PT --> T[TargetResolver<br/>which output file?]
+    O[("Extracted media<br/>--output folder")] --> T
+    T --> A[apply_metadata_batch<br/>keep or write dates,<br/>escaped ExifTool argfile]
+    A --> O
+    A --> PR[("ProgressStore<br/>journal + progress file")]
 ```
 
-- **`google_takeout_metadata_fixer.py`** is the core. It holds the matching rules, sidecar parsing, ExifTool argument building and batching, the ADB and local zip readers, and the resumable main loop. The recovery helper imports these functions.
+- **`google_takeout_metadata_fixer.py`** is the core. It holds sidecar matching (`SidecarIndex`), sidecar parsing, the date rule and ExifTool batching (`apply_metadata_batch`), target resolution (`TargetResolver`), resume state (`ProgressStore`), the ADB and local zip readers, and the main loop. The recovery helper imports these.
 - **`extract_takeout_media.py`** is a standalone extract-and-fix pipeline with its own (simpler) matcher.
 - **`adb_resumable_copy.py`** pushes files to the device, skipping ones whose size already matches.
 - **`recover_takeout_zip_metadata.py`** handles zips the phone's `unzip` can't list reliably. It pushes one shell script that reads every JSON's local header and data in a single ADB call, then decompresses with `zlib` on the host.
@@ -134,21 +150,23 @@ flowchart LR
 
 ## Testing
 
-The test suite builds tiny fixtures on the fly (8×8 JPEGs from Pillow, synthetic Takeout zips in a temp directory), so no real photos are stored in the repo. It has 58 tests:
+The test suite builds every fixture itself (an embedded 8×8 JPEG, generated PNG and MP4 files, synthetic Takeout zips in a temp directory), so no real photos, locations or names are stored in the repo, and no imaging library is needed. It has more than 240 tests:
 
-- unit tests for every matching rule, sidecar parsing, ExifTool argument generation and the JSON stream splitter
-- zip central-directory parsing checked against Python's `zipfile`
-- `--help` smoke tests for every CLI
-- end-to-end runs that call the real ExifTool and read the written tags back, covering resume and dry-run behaviour
+- unit tests for sidecar matching, sidecar parsing, ExifTool argument generation and sidecar pairing
+- round-trips through the real ExifTool that read the written tags back: dates and time zones, GPS in all four hemispheres on JPEG, PNG and MP4, multi-line and hostile captions
+- resume behaviour: interrupted runs, failed batches, damaged progress files, same-named photos from different albums
+- the phone mode, driven end to end against a stand-in for `adb` ([`tests/fake_adb.py`](tests/fake_adb.py))
+- zip central-directory parsing checked against Python's `zipfile`, and `--help` smoke tests for every CLI
 
 ```bash
 pip install -r requirements-dev.txt
-sudo apt-get install -y libimage-exiftool-perl   # end-to-end tests are skipped if exiftool is missing
+sudo apt-get install -y libimage-exiftool-perl   # tests marked "exiftool" are skipped if it is missing
 ruff check .
+mypy
 python -m pytest -v
 ```
 
-GitHub Actions ([`ci.yml`](.github/workflows/ci.yml)) runs `ruff check .` and runs the test suite on Python 3.9, 3.11 and 3.12 for every push and pull request.
+GitHub Actions ([`ci.yml`](.github/workflows/ci.yml)) runs ruff and mypy, the test suite on Python 3.10 to 3.15, a gitleaks scan of the full history and `pip-audit`, for every push and pull request and once a week. Dependabot proposes updates for the pinned tools and actions.
 
 ## Project structure
 
@@ -159,19 +177,25 @@ GitHub Actions ([`ci.yml`](.github/workflows/ci.yml)) runs `ruff check .` and ru
 ├── recover_takeout_zip_metadata.py    # raw zip central-directory recovery over ADB
 ├── adb_resumable_copy.py              # resumable copy back to an Android device
 ├── google_photos_downloader.py        # optional Google Photos API downloader
-├── tests/                             # pytest suite with generated fixtures
+├── tests/                             # pytest suite with generated fixtures and a stand-in adb
 ├── docs/                              # banner and demo images
 ├── assets/icon.svg                    # project icon
-├── pyproject.toml                     # ruff + pytest configuration
+├── pyproject.toml                     # project metadata, ruff, mypy and pytest configuration
 ├── requirements.txt                   # downloader dependencies
-├── requirements-dev.txt               # test/lint dependencies
-└── .github/workflows/ci.yml           # lint + test CI
+├── requirements-dev.txt               # pinned test, lint and audit tools
+├── CHANGELOG.md
+└── .github/
+    ├── workflows/ci.yml               # lint, type check, tests, secret scan, dependency audit
+    └── dependabot.yml                 # weekly updates for pip and GitHub Actions
 ```
 
 ## Limitations and roadmap
 
 - The fixer only indexes files at the top level of `--output`, not subfolders. This matches the flat layout produced by `extract_takeout_media.py`.
-- Timestamps are written as UTC wall-clock time, because Takeout sidecars store a UTC epoch. No local-timezone offset is applied.
+- A sidecar is only looked for in the same zip as its media file. Takeout sometimes puts the two in different parts of a multi-part export; those files are counted under "No JSON sidecar found".
+- Takeout sidecars store the capture instant in UTC, not the local time. When a date has to be written to a photo it is written as UTC with an explicit `+00:00` offset; a photo that already has a consistent camera time keeps it. Videos always get UTC, which is what their date fields are defined to hold.
+- In a flat output folder, two different photos with the same file name can only be told apart by file size or by a capture time already in the file. If neither identifies them, they are reported as ambiguous and left untouched.
+- ExifTool cannot write AVI, MKV, WebM or BMP files. They are listed as errors once and then skipped.
 - Favourite status is parsed but not written to files.
 - `extract_takeout_media.py` has its own simpler matcher and doesn't write people tags. Folding it into the shared matcher is a natural next step.
 - ADB mode is exercised only through manual use. The automated tests cover local-zip mode and the pure logic.

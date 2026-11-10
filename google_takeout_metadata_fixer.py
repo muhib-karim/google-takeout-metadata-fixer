@@ -2,11 +2,10 @@
 """
 Google Takeout Metadata Fixer
 =============================
-GitHub-ready Google Takeout / Google Photos Takeout metadata fixer.
+Restores metadata from Google Takeout (Google Photos) exports.
 
-The most comprehensive tool for recovering metadata from Google Takeout exports.
-Embeds dates, GPS coordinates, descriptions, and people tags directly into your
-photos and videos using ExifTool — so they sort correctly everywhere.
+Embeds dates, GPS coordinates, descriptions, and people tags from the JSON sidecars
+directly into your photos and videos using ExifTool, so they sort correctly everywhere.
 
 Two modes:
   ADB mode:   Streams JSON sidecars from zips on your Android phone via USB.
@@ -27,7 +26,7 @@ Features:
   - Resume support — safely restarts from where it left off
 
 Requirements:
-  - Python 3.9+
+  - Python 3.10+
   - ExifTool (https://exiftool.org) on PATH
   - ADB on PATH (only for ADB mode — phone connected via USB)
 
