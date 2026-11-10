@@ -31,9 +31,9 @@ ZIP_NAME = None
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from google_takeout_metadata_fixer import (  # noqa: E402
     EXIFTOOL_BATCH_SIZE,
+    SidecarIndex,
     apply_metadata_batch,
     build_exiftool_args,
-    find_json_match,
     format_size,
     format_time,
     is_media,
@@ -377,7 +377,6 @@ def main():
     media_entries = [e for e in all_entries if is_media(e['name']) and not e['name'].endswith('/')]
     print(f"  {len(json_entries):,} JSON sidecars, {len(media_entries):,} media files")
 
-    nameset = set(e['name'] for e in all_entries)
 
     # Step 3: Index output files
     print("\nStep 3: Indexing output files...")
@@ -391,12 +390,12 @@ def main():
     print(f"\nStep 4: Batch extracting {len(json_entries):,} JSON sidecars...")
     json_data_map = batch_extract_jsons(json_entries)
 
-    # Build title index
-    json_title_index = {}
-    for json_path, data in json_data_map.items():
-        title = data.get("title")
-        if title and isinstance(title, str) and title not in json_title_index:
-            json_title_index[title] = json_path
+    # Index the listing; sidecar titles settle what names alone cannot
+    titles = {
+        json_path: data["title"] for json_path, data in json_data_map.items()
+        if isinstance(data, dict) and isinstance(data.get("title"), str) and data["title"]
+    }
+    sidecar_index = SidecarIndex([e['name'] for e in all_entries], titles)
 
     # Step 5: Load progress
     progress = load_progress()
@@ -434,7 +433,7 @@ def main():
             continue
 
         # Find JSON match
-        json_name = find_json_match(nameset, media_e['name'], json_title_index)
+        json_name = sidecar_index.match(media_e['name'])
         if not json_name:
             stats['no_json'] += 1
             processed_set.add(entry_key)

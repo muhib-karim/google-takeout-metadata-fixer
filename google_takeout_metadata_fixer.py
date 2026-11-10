@@ -52,7 +52,8 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Sequence
+import unicodedata
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -122,166 +123,324 @@ def save_progress(progress):
 # ---------------------------------------------------------------------------
 # JSON SIDECAR MATCHING (the core challenge)
 #
-# Google Takeout generates JSON sidecars with inconsistent naming:
-#   - photo.jpg.supplemental-metadata.json        (new format, standard)
-#   - photo.jpg.supplemental-metad.json            (new format, truncated)
-#   - photo.jpg.supplemental-metadata(1).json      (duplicate index)
-#   - photo.jpg.json                                (old format)
-#   - photo.json                                    (old format, stem only)
-#   - photo.jpg(1).json                             (old bracket format)
-#   - photo(2).jpg -> photo.jpg.supplemental-metadata(2).json  (Google dups)
-#   - photo-edited.jpg -> photo.jpg's JSON          (edited variants)
-#   - video.mp4 -> photo.jpg's JSON                 (live photos)
+# Google Takeout names the JSON sidecar of a media file inconsistently:
+#   - photo.jpg.supplemental-metadata.json          new format
+#   - photo.jpg.supplemental-metad.json             new format, cut short
+#   - photo.jpg.json / photo.json                   old format (full name / stem)
+#   - photo(1).jpg -> photo.jpg.supplemental-metadata(1).json   duplicate, new format
+#   - photo(1).jpg -> photo.jpg(1).json                         duplicate, old format
+#   - photo-edited.jpg -> photo.jpg's sidecar       edited copies
+#   - video.mp4 -> photo.heic's sidecar             live photos
+#
+# The sidecar name without ".json" is cut to 46 UTF-16 units, so the cut can land
+# anywhere: inside ".supplemental-metadata", right after its dot, or, for long media
+# names, inside the media name itself.
+#
+# Matching works per directory. Every media file in a directory is resolved once:
+# strict matches first (the duplicate index of the file and of the sidecar must agree),
+# then, for files still without a sidecar, a sidecar nobody claimed may be borrowed.
+# That order is what keeps two files from being handed the same sidecar.
 # ---------------------------------------------------------------------------
 
-def find_json_match(nameset, media_entry, json_title_index=None):
+SUPPLEMENTAL = "supplemental-metadata"
+TRUNCATED_LENGTHS = (46, 47)  # UTF-16 units of a sidecar base name that was cut short
+STILL_EXTENSIONS = (".jpg", ".jpeg", ".heic", ".png", ".JPG", ".JPEG", ".HEIC", ".PNG")
+LIVE_VIDEO_EXTENSIONS = (".mp4", ".mov")
+
+_INDEX = re.compile(r"\((\d+)\)")
+_EDITED_STEM = re.compile(
+    r"^(.+)-(?:edited|bearbeitet|modifi[eé]|editado|modificato|bewerkt|"
+    r"edytowany|redigerad|muokattu|d[uü]zenlendi|отредактировано|編集済み)$",
+    re.IGNORECASE,
+)
+
+# Match tiers, best first
+_FULL, _CUT, _PLAIN, _STEM_OLD, _STEM_NEW, _TRUNCATED = range(6)
+
+
+def _split_entry(entry: str) -> tuple[str, str]:
+    """Split a zip entry into (directory including the trailing slash, base name)."""
+    head, sep, tail = entry.rpartition("/")
+    return head + sep, tail
+
+
+def _strip_last_index(name: str) -> tuple[str, int | None]:
+    """Remove the last "(N)" from a name. Returns (name without it, N or None)."""
+    matches = list(_INDEX.finditer(name))
+    if not matches:
+        return name, None
+    last = matches[-1]
+    return name[:last.start()] + name[last.end():], int(last.group(1))
+
+
+def _utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def _utf16_cut(text: str, units: int) -> str:
+    """Longest prefix of text that fits in the given number of UTF-16 units."""
+    used = 0
+    for position, char in enumerate(text):
+        used += 2 if ord(char) > 0xFFFF else 1
+        if used > units:
+            return text[:position]
+    return text
+
+
+class _Directory:
+    """The media files and sidecars of one zip directory."""
+
+    def __init__(self) -> None:
+        self.media: set[str] = set()
+        self.titles: dict[str, str] = {}
+        # (name the sidecar is for, duplicate index) -> [(tier, tie-break, sidecar base name)]
+        self.by_target: dict[tuple[str, int | None], list[tuple[int, int, str]]] = {}
+        self.resolved: dict[str, str | None] | None = None
+
+    def add_sidecar(self, basename: str) -> None:
+        base = basename[: -len(".json")]
+        readings: list[tuple[str, int | None]] = [(base, None)]
+        stripped, index = _strip_last_index(base)
+        if index is not None:
+            readings.append((stripped, index))
+        for name, idx in readings:
+            self._add(name, idx, _PLAIN, 0, basename)
+            head, dot, tail = name.rpartition(".")
+            if dot and tail == SUPPLEMENTAL:
+                self._add(head, idx, _FULL, 0, basename)
+            elif dot and SUPPLEMENTAL.startswith(tail):
+                # tail is a cut of "supplemental-metadata", possibly empty ("name.jpg..json")
+                self._add(head, idx, _CUT, -len(tail), basename)
+
+    def _add(self, target: str, index: int | None, tier: int, tie: int, basename: str) -> None:
+        self.by_target.setdefault((target, index), []).append((tier, tie, basename))
+
+
+class SidecarIndex:
+    """Index of one zip listing for matching media files to their JSON sidecars.
+
+    names:  every entry name in the zip
+    titles: optional {sidecar entry name: its JSON "title"}, used to settle cases the
+            file names alone cannot (two long names cut to the same sidecar name)
+    """
+
+    def __init__(self, names: Iterable[str], titles: Mapping[str, str] | None = None) -> None:
+        self._names = set(names)
+        self._dirs: dict[str, _Directory] = {}
+        for entry in self._names:
+            parent, basename = _split_entry(entry)
+            if not basename:
+                continue
+            directory = self._dirs.setdefault(parent, _Directory())
+            if basename.endswith(".json"):
+                directory.add_sidecar(basename)
+            elif is_media(basename):
+                directory.media.add(basename)
+        for entry, title in (titles or {}).items():
+            parent, basename = _split_entry(entry)
+            if isinstance(title, str) and parent in self._dirs:
+                self._dirs[parent].titles[basename] = title
+
+    def __contains__(self, name: object) -> bool:
+        return name in self._names
+
+    def __len__(self) -> int:
+        return len(self._names)
+
+    def match(self, media_entry: str, json_title_index: Mapping[str, str] | None = None) -> str | None:
+        """Return the sidecar entry for a media entry, or None."""
+        parent, basename = _split_entry(media_entry)
+        directory = self._dirs.get(parent)
+        if directory is None:
+            directory = self._dirs[parent] = _Directory()
+        if basename not in directory.media:
+            directory.media.add(basename)
+            directory.resolved = None
+        if directory.resolved is None:
+            directory.resolved = _resolve_directory(directory)
+        found = directory.resolved.get(basename)
+        if found is not None:
+            return parent + found
+
+        # Last resort: a caller-supplied {title: sidecar entry} mapping. Only a sidecar in
+        # the same directory that no other file matched is accepted.
+        if json_title_index:
+            candidate = json_title_index.get(basename)
+            if isinstance(candidate, str):
+                cand_parent, cand_base = _split_entry(candidate)
+                if cand_parent == parent and cand_base not in set(directory.resolved.values()):
+                    return candidate
+        return None
+
+
+def _candidates(directory: _Directory, name: str, index: int | None) -> list[tuple[int, int, str]]:
+    """Sidecars for (name, index), best first: full name tiers, then stem-only, then truncated."""
+    found = list(directory.by_target.get((name, index), ()))
+    stem = os.path.splitext(name)[0]
+    if stem != name:
+        for tier, tie, basename in directory.by_target.get((stem, index), ()):
+            found.append((_STEM_OLD if tier == _PLAIN else _STEM_NEW, tie, basename))
+    length = _utf16_len(name)
+    for units in TRUNCATED_LENGTHS:
+        if length > units:
+            for tier, _, basename in directory.by_target.get((_utf16_cut(name, units), index), ()):
+                if tier == _PLAIN:
+                    found.append((_TRUNCATED, units, basename))
+    return sorted(found)
+
+
+def _strict_candidates(directory: _Directory, basename: str) -> list[tuple[int, int, str]]:
+    """Candidates for a media name read literally, then with its last "(N)" as a duplicate index."""
+    found = [(tier, 0, tie, side) for tier, tie, side in _candidates(directory, basename, None)]
+    stripped, index = _strip_last_index(basename)
+    if index is not None:
+        found += [(tier, 1, tie, side) for tier, tie, side in _candidates(directory, stripped, index)]
+    return [(tier, tie, side) for tier, _, tie, side in sorted(found)]
+
+
+def _with_index(name: str, index: int | None) -> str:
+    """Put a duplicate index back in front of the extension: ("a.jpg", 1) -> "a(1).jpg"."""
+    if index is None:
+        return name
+    stem, ext = os.path.splitext(name)
+    return f"{stem}({index}){ext}"
+
+
+def _derived_names(basename: str) -> list[str]:
+    """Names whose sidecar this file shares: the original of an edited copy, the still of a live video."""
+    names: list[str] = []
+    stripped, index = _strip_last_index(unicodedata.normalize("NFC", basename))
+    stem, ext = os.path.splitext(stripped)
+    edited = _EDITED_STEM.match(stem)
+    if edited and ext:
+        names.append(_with_index(edited.group(1) + ext, index))
+    if ext.lower() in LIVE_VIDEO_EXTENSIONS:
+        names.extend(_with_index(stem + still, index) for still in STILL_EXTENSIONS)
+    return names
+
+
+def _title_matches(title: str | None, basename: str) -> bool:
+    return title is not None and title in (basename, _strip_last_index(basename)[0])
+
+
+def _resolve_directory(directory: _Directory) -> dict[str, str | None]:
+    """Assign a sidecar (or None) to every media file of a directory."""
+    resolved: dict[str, str | None] = {}
+    claimed: set[str] = set()
+    pending = sorted(directory.media)
+
+    # 1. Strict matches on the file's own name.
+    truncated_wants: dict[str, list[str]] = {}
+    for media in pending:
+        candidates = _strict_candidates(directory, media)
+        exact = [side for tier, _, side in candidates if tier != _TRUNCATED]
+        if exact:
+            resolved[media] = exact[0]
+            claimed.add(exact[0])
+        else:
+            for _, _, side in candidates:
+                truncated_wants.setdefault(side, []).append(media)
+
+    # 2. Truncated names: a cut name can be the prefix of several files, so it is only
+    #    accepted when exactly one file wants it, or when the sidecar's title says which.
+    for side in sorted(truncated_wants):
+        wanting = [m for m in truncated_wants[side] if m not in resolved]
+        if side in claimed or not wanting:
+            continue
+        if len(wanting) > 1:
+            wanting = [m for m in wanting if _title_matches(directory.titles.get(side), m)]
+        if len(wanting) == 1:
+            resolved[wanting[0]] = side
+            claimed.add(side)
+
+    # 3. Edited copies and live-photo videos share the sidecar of the file they derive from.
+    for media in pending:
+        if media in resolved:
+            continue
+        for name in _derived_names(media):
+            candidates = [side for tier, _, side in _strict_candidates(directory, name) if tier <= _PLAIN]
+            if candidates:
+                resolved[media] = candidates[0]
+                break
+
+    # 4. Titles: a sidecar nobody matched whose JSON title is this file's name.
+    #    A title equal to the full file name is decisive whatever "(N)" the sidecar
+    #    carries: two long names cut to the same sidecar name are told apart that way.
+    #    A title equal to the name without its duplicate index must agree on the index.
+    by_title: dict[str, list[tuple[int, str]]] = {}
+    for side, title in directory.titles.items():
+        side_index = _strip_last_index(side[: -len(".json")])[1]
+        by_title.setdefault(title, []).append((-1 if side_index is None else side_index, side))
+    for media in pending:
+        if media in resolved:
+            continue
+        stripped, index = _strip_last_index(media)
+        free = [side for _, side in sorted(by_title.get(media, ())) if side not in claimed]
+        if not free and index is not None:
+            free = [
+                side for side_index, side in sorted(by_title.get(stripped, ()))
+                if side not in claimed and side_index == index
+            ]
+        if free:
+            resolved[media] = free[0]
+            claimed.add(free[0])
+
+    # 5. Borrowing: a sidecar for the same name with a different duplicate index, but only
+    #    one that no file in this directory matched (its own file is not in the zip).
+    for media in pending:
+        if media in resolved:
+            continue
+        stripped, index = _strip_last_index(media)
+        options: list[tuple[int, int, int, int, str]] = []
+        for (target, other), entries in directory.by_target.items():
+            if other == index:
+                continue
+            for tier, tie, side in entries:
+                if target == stripped:
+                    rank = tier
+                elif target == os.path.splitext(stripped)[0] and target != stripped:
+                    rank = _STEM_OLD if tier == _PLAIN else _STEM_NEW
+                else:
+                    continue
+                options.append((rank, 0 if other is None else 1, other or 0, tie, side))
+        for *_, side in sorted(options):
+            if side not in claimed:
+                resolved[media] = side
+                break
+
+    for media in pending:
+        resolved.setdefault(media, None)
+    return resolved
+
+
+_last_index: tuple[Any, int, SidecarIndex] | None = None
+
+
+def find_json_match(
+    nameset: Iterable[str] | SidecarIndex, media_entry: str, json_title_index: Mapping[str, str] | None = None
+) -> str | None:
     """Find the JSON sidecar for a media file within a zip's namelist.
 
     Args:
-        nameset: set of all filenames in the zip
+        nameset: all entry names in the zip (any iterable), or a prebuilt SidecarIndex.
+                 Passing the same set again reuses the index built for it.
         media_entry: full path of the media file in the zip
-        json_title_index: dict mapping JSON 'title' field -> JSON entry path
-                         (optional, for title-based fallback matching)
+        json_title_index: optional dict mapping JSON 'title' field -> JSON entry path,
+                          used as a last resort within the media file's directory
 
     Returns:
         The matching JSON entry path, or None.
     """
-    p_media = media_entry.rsplit("/", 1)
-    parent = p_media[0] + "/" if len(p_media) > 1 else ""
-    basename = p_media[-1]
-    stem = Path(basename).stem
-    ext = Path(basename).suffix
-
-    # --- Rule 1: supplemental-metadata (new format) ---
-    c = f"{media_entry}.supplemental-metadata.json"
-    if c in nameset:
-        return c
-
-    # --- Rule 2: supplemental-metadata with duplicate index ---
-    for i in range(1, 20):
-        c = f"{media_entry}.supplemental-metadata({i}).json"
-        if c in nameset:
-            return c
-
-    # --- Rule 3: Truncated supplemental-metadata ---
-    # Google truncates the JSON filename to a max length, cutting into
-    # ".supplemental-metadata" at any point. We match by prefix.
-    prefix = f"{media_entry}.suppl"
-    for name in nameset:
-        if name.startswith(prefix) and name.endswith(".json"):
-            return name
-
-    # Also try with just "." prefix for extreme truncation (.s.json, ..json)
-    prefix_dot = f"{media_entry}."
-    for name in nameset:
-        if (name.startswith(prefix_dot) and name.endswith(".json")
-                and name != f"{media_entry}.json"):  # don't match old format yet
-            inner = name[len(prefix_dot):-5]  # between "photo.jpg." and ".json"
-            # prefix_dot already consumed the dot, so compare without it
-            # ("s", "su", ...); also accept a leftover dot ("..json")
-            inner = inner.lower()
-            if inner and ("supplemental-metadata".startswith(inner)
-                          or ".supplemental-metadata".startswith(inner)):
-                return name
-
-    # --- Rule 4: Google duplicate files ---
-    # file(N).ext -> file.ext.supplemental-metadata(N).json
-    dup_match = re.match(r'^(.+?)\((\d+)\)(\.[^.]+)$', basename)
-    if dup_match:
-        orig_name = dup_match.group(1) + dup_match.group(3)
-        dup_idx = dup_match.group(2)
-        orig_entry = parent + orig_name
-        # Try: original.ext.supplemental-metadata(N).json
-        c = f"{orig_entry}.supplemental-metadata({dup_idx}).json"
-        if c in nameset:
-            return c
-        # Try: original.ext.supplemental-metadata.json (shared metadata)
-        c = f"{orig_entry}.supplemental-metadata.json"
-        if c in nameset:
-            return c
-        # Try other indices
-        for i in range(1, 20):
-            c = f"{orig_entry}.supplemental-metadata({i}).json"
-            if c in nameset:
-                return c
-        # Truncated version for the original name
-        prefix = f"{orig_entry}.suppl"
-        for name in nameset:
-            if name.startswith(prefix) and name.endswith(".json"):
-                return name
-        # Old format for the original
-        c = f"{orig_entry}.json"
-        if c in nameset:
-            return c
-        orig_stem = Path(orig_name).stem
-        c = parent + orig_stem + ".json"
-        if c in nameset:
-            return c
-
-    # --- Rule 5: Old format (pre-2024 exports) ---
-    c = media_entry + ".json"
-    if c in nameset:
-        return c
-
-    # Old format: stem only
-    c = parent + stem + ".json"
-    if c in nameset:
-        return c
-
-    # Old bracket variations: photo.jpg(1).json
-    for i in range(1, 10):
-        c = f"{media_entry}({i}).json"
-        if c in nameset:
-            return c
-
-    # --- Rule 6: Edited files (12+ languages) ---
-    # photo-edited.jpg -> photo.jpg.supplemental-metadata.json
-    # Covers: -edited (EN), -bearbeitet (DE), -modifié (FR), -editado (ES/PT),
-    #         -modificato (IT), -bewerkt (NL), -edytowany (PL), -redigerad (SV),
-    #         -muokattu (FI), -düzenlendi (TR), -отредактировано (RU), -編集済み (JA)
-    edited_match = re.match(
-        r'^(.+)-(?:edited|bearbeitet|modifi[eé]|editado|modificato|bewerkt|'
-        r'edytowany|redigerad|muokattu|d[uü]zenlendi|отредактировано|編集済み)'
-        r'(\.[^.]+)$', basename, re.IGNORECASE
-    )
-    if edited_match:
-        orig_name = edited_match.group(1) + edited_match.group(2)
-        orig_entry = parent + orig_name
-        c = f"{orig_entry}.supplemental-metadata.json"
-        if c in nameset:
-            return c
-        c = orig_entry + ".json"
-        if c in nameset:
-            return c
-        prefix = f"{orig_entry}.suppl"
-        for name in nameset:
-            if name.startswith(prefix) and name.endswith(".json"):
-                return name
-
-    # --- Rule 7: Live photos ---
-    # video.mp4 -> matching still image's JSON
-    ext_lower = ext.lower()
-    if ext_lower in ('.mp4', '.mov'):
-        for photo_ext in ('.jpg', '.jpeg', '.heic', '.png',
-                          '.JPG', '.JPEG', '.HEIC', '.PNG'):
-            photo_entry = parent + stem + photo_ext
-            c = f"{photo_entry}.supplemental-metadata.json"
-            if c in nameset:
-                return c
-            c = photo_entry + ".json"
-            if c in nameset:
-                return c
-            prefix = f"{photo_entry}.suppl"
-            for name in nameset:
-                if name.startswith(prefix) and name.endswith(".json"):
-                    return name
-
-    # --- Rule 8: JSON title field matching ---
-    # Some JSONs have a 'title' field that matches the media filename.
-    if json_title_index and basename in json_title_index:
-        return json_title_index[basename]
-
-    return None
+    global _last_index
+    if isinstance(nameset, SidecarIndex):
+        index = nameset
+    elif _last_index is not None and _last_index[0] is nameset and _last_index[1] == len(nameset):  # type: ignore[arg-type]
+        index = _last_index[2]
+    else:
+        index = SidecarIndex(nameset)
+        if isinstance(nameset, (set, frozenset, list, tuple)):
+            _last_index = (nameset, len(nameset), index)
+    return index.match(media_entry, json_title_index)
 
 
 # ---------------------------------------------------------------------------
@@ -1043,7 +1202,6 @@ def main():
         else:
             entries = adb_get_zip_listing(remote_zip)
         all_names = [name for _, name in entries]
-        nameset = set(all_names)
         media_entries = [name for name in all_names if is_media(name) and not name.endswith("/")]
         json_entries = [name for name in all_names if name.endswith(".json")]
         print(f" {len(media_entries)} media, {len(json_entries)} JSON ({time.time()-t:.1f}s)")
@@ -1064,12 +1222,12 @@ def main():
         json_data_map = parse_concatenated_jsons(raw_json_bytes, json_entries)
         print(f" {len(json_data_map)}/{len(json_entries)} parsed ({time.time()-t:.1f}s)")
 
-        # Build JSON title index for fallback matching
-        json_title_index = {}
-        for json_path, data in json_data_map.items():
-            title = data.get("title")
-            if title and isinstance(title, str):
-                json_title_index[title] = json_path
+        # Index the listing once per zip; sidecar titles settle what names alone cannot
+        titles = {
+            json_path: data["title"] for json_path, data in json_data_map.items()
+            if isinstance(data.get("title"), str) and data["title"]
+        }
+        sidecar_index = SidecarIndex(all_names, titles)
 
         # Step 4: Process each media file
         print(f"  Processing {len(media_entries)} media files...")
@@ -1104,7 +1262,7 @@ def main():
                 continue
 
             # Find JSON sidecar
-            json_entry = find_json_match(nameset, media_entry, json_title_index)
+            json_entry = sidecar_index.match(media_entry)
             if not json_entry:
                 zip_stats["no_json"] += 1
                 processed_set.add(entry_key)
