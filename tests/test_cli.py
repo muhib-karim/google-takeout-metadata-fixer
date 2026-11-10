@@ -1,7 +1,6 @@
 """CLI smoke tests and an end-to-end run of the local-zip mode."""
 
 import json
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +11,6 @@ import google_takeout_metadata_fixer as fixer
 from tests.takeout_fixtures import sidecar, write_zip
 
 REPO = Path(__file__).resolve().parent.parent
-HAS_EXIFTOOL = shutil.which("exiftool") is not None
 
 
 @pytest.mark.parametrize(
@@ -80,7 +78,7 @@ def _run_main(monkeypatch, argv):
     fixer.main()
 
 
-@pytest.mark.skipif(not HAS_EXIFTOOL, reason="exiftool not installed")
+@pytest.mark.exiftool
 def test_dry_run_does_not_modify_files_or_save_progress(tmp_path, monkeypatch, capsys, jpeg_bytes):
     zips, out = _build_takeout(tmp_path, jpeg_bytes)
     monkeypatch.chdir(tmp_path)
@@ -96,7 +94,7 @@ def test_dry_run_does_not_modify_files_or_save_progress(tmp_path, monkeypatch, c
     assert not (tmp_path / fixer.PROGRESS_FILE).exists()
 
 
-@pytest.mark.skipif(not HAS_EXIFTOOL, reason="exiftool not installed")
+@pytest.mark.exiftool
 def test_end_to_end_writes_exif_and_resumes(tmp_path, monkeypatch, capsys, jpeg_bytes):
     zips, out = _build_takeout(tmp_path, jpeg_bytes)
     monkeypatch.chdir(tmp_path)

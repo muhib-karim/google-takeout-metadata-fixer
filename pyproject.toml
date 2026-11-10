@@ -11,4 +11,7 @@ ignore = ["E501", "E741"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = "-ra"
+addopts = "-ra --strict-markers"
+markers = [
+    "exiftool: calls the real exiftool binary (skipped when it is not installed)",
+]
