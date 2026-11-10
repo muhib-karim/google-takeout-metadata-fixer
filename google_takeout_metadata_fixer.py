@@ -977,11 +977,114 @@ def adb_stream_single_json(remote_zip, json_entry):
     return r.stdout
 
 
-def parse_concatenated_jsons(raw_bytes, json_names_ordered):
-    """Parse a stream of concatenated JSON objects and match to filenames.
+def _decode_json_values(raw_bytes: bytes) -> list[Any] | None:
+    """Decode consecutive top-level JSON values. Returns None if anything fails to parse."""
+    text = raw_bytes.decode("utf-8", errors="replace")
+    decoder = json.JSONDecoder()
+    values: list[Any] = []
+    position = 0
+    while True:
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position >= len(text):
+            return values
+        try:
+            value, position = decoder.raw_decode(text, position)
+        except json.JSONDecodeError:
+            return None
+        values.append(value)
 
-    The key insight: 'unzip -p *.json' outputs JSONs in the same order
-    as they appear in the zip directory, which matches 'unzip -l' order.
+
+def _loads_object(raw: bytes) -> dict[str, Any] | None:
+    """Parse one JSON document; only an object counts as a sidecar."""
+    try:
+        value = json.loads(raw.decode("utf-8", errors="replace"))
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _fold(text: str) -> str:
+    """Approximate what Takeout does to a title when it becomes a file name."""
+    text = unicodedata.normalize("NFC", text)
+    return "".join(c if c.isalnum() or c in "._-() " else "_" for c in text)
+
+
+def sidecar_name_matches_title(json_name: str, title: str) -> bool:
+    """True if a sidecar's file name is plausible for the "title" stored inside it.
+
+    The title is the original media file name. The sidecar name is derived from it, with
+    some characters replaced, possibly cut short, possibly with a "(N)" added. This is a
+    sanity check on a pairing made by other means, not a way to find the sidecar.
+    """
+    base = _split_entry(json_name)[1]
+    if base.endswith(".json"):
+        base = base[: -len(".json")]
+    folded_title = _fold(title)
+    expected = f"{folded_title}.{SUPPLEMENTAL}"
+    title_stem = os.path.splitext(folded_title)[0]
+    for candidate in (base, _strip_last_index(base)[0]):
+        folded = _fold(candidate)
+        if not expected.startswith(folded):
+            continue
+        cut_short = _utf16_len(candidate) in (45, *TRUNCATED_LENGTHS)
+        if len(folded) >= len(folded_title) or folded == title_stem or cut_short:
+            return True
+    return False
+
+
+def _looks_like_wrong_sidecar(name: str, value: dict[str, Any]) -> bool:
+    title = value.get("title")
+    return "photoTakenTime" in value and isinstance(title, str) and not sidecar_name_matches_title(name, title)
+
+
+def pair_json_stream(
+    raw_bytes: bytes, sized_names: Sequence[tuple[int, str]]
+) -> tuple[dict[str, dict[str, Any]], str]:
+    """Pair a stream of concatenated sidecars with their entry names.
+
+    ``sized_names`` is the (uncompressed size, entry name) of every JSON entry, in listing
+    order; ``raw_bytes`` is what ``unzip -p zip "*.json"`` printed. Returns
+    ``({entry name: parsed object}, method)``:
+
+    "sizes"  The listed sizes add up to the stream length, so the stream is cut at those
+             offsets. An empty or non-object sidecar simply has no entry in the result.
+    "order"  The sizes do not add up (an old adb translating line endings, for example).
+             The stream is paired by position only if it holds exactly one JSON value per
+             name and every sidecar's title agrees with its name.
+    "none"   Neither holds. Nothing is paired; the caller reads sidecars one by one.
+
+    Names missing from the result are the caller's to read individually.
+    """
+    paired: dict[str, dict[str, Any]] = {}
+    if sum(size for size, _ in sized_names) == len(raw_bytes):
+        position = 0
+        for size, name in sized_names:
+            value = _loads_object(raw_bytes[position:position + size])
+            position += size
+            if value is not None and not _looks_like_wrong_sidecar(name, value):
+                paired[name] = value
+        return paired, "sizes"
+
+    values = _decode_json_values(raw_bytes)
+    if values is None or len(values) != len(sized_names):
+        return {}, "none"
+    for (_, name), value in zip(sized_names, values):
+        if not isinstance(value, dict):
+            continue
+        if _looks_like_wrong_sidecar(name, value):
+            return {}, "none"
+        paired[name] = value
+    return paired, "order"
+
+
+def parse_concatenated_jsons(raw_bytes: bytes, json_names_ordered: Sequence[str]) -> dict[str, dict[str, Any]]:
+    """Parse a stream of concatenated JSON objects and pair them with names by position.
+
+    Kept for callers that have names but no sizes; :func:`pair_json_stream` is safer and is
+    what the fixer uses. Objects are paired with names only when there is exactly one
+    object per name. With any other count the result is empty, because a single missing
+    or extra object shifts every later pair onto the wrong name.
 
     Returns dict of {json_entry_path: parsed_dict}.
     """
@@ -990,7 +1093,7 @@ def parse_concatenated_jsons(raw_bytes, json_names_ordered):
     # Decode consecutive top-level JSON objects. raw_decode understands string
     # literals, so braces inside descriptions/titles don't break the split.
     decoder = json.JSONDecoder()
-    parsed_list = []
+    parsed_list: list[dict[str, Any] | None] = []
     pos = 0
     while True:
         start = text.find("{", pos)
@@ -1006,23 +1109,9 @@ def parse_concatenated_jsons(raw_bytes, json_names_ordered):
         parsed_list.append(obj if isinstance(obj, dict) else None)
         pos = end
 
-    result = {}
-    # If counts match, pair by order (fastest case)
-    if len(parsed_list) == len(json_names_ordered):
-        for name, obj in zip(json_names_ordered, parsed_list):
-            if obj is not None:
-                result[name] = obj
-    else:
-        # If close in count, still pair sequentially (some might be metadata.json etc.)
-        if abs(len(parsed_list) - len(json_names_ordered)) <= len(json_names_ordered) * 0.05:
-            for i, name in enumerate(json_names_ordered):
-                if i < len(parsed_list) and parsed_list[i]:
-                    result[name] = parsed_list[i]
-        else:
-            # Large mismatch — fall back to individual reads (handled by caller)
-            pass
-
-    return result
+    if len(parsed_list) != len(json_names_ordered):
+        return {}
+    return {name: obj for name, obj in zip(json_names_ordered, parsed_list) if obj is not None}
 
 
 # ---------------------------------------------------------------------------
@@ -1061,6 +1150,25 @@ def local_stream_all_jsons(zip_path):
             if info.filename.endswith(".json") and not info.is_dir():
                 chunks.append(zf.read(info.filename))
     return b"".join(chunks)
+
+
+def local_read_jsons(zip_path: str | os.PathLike[str], names: Iterable[str]) -> dict[str, dict[str, Any]]:
+    """Read sidecars from a local zip by entry name. Returns {entry name: parsed object}.
+
+    Reading by name cannot pair a sidecar with the wrong name. Entries that are missing,
+    unreadable or not a JSON object are left out.
+    """
+    import zipfile
+    found: dict[str, dict[str, Any]] = {}
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for name in names:
+            try:
+                value = _loads_object(zf.read(name))
+            except (KeyError, OSError, zipfile.BadZipFile, RuntimeError):
+                continue
+            if value is not None:
+                found[name] = value
+    return found
 
 
 def local_stream_single_json(zip_path, json_entry):
@@ -1206,21 +1314,27 @@ def main():
         json_entries = [name for name in all_names if name.endswith(".json")]
         print(f" {len(media_entries)} media, {len(json_entries)} JSON ({time.time()-t:.1f}s)")
 
-        # Step 2: Stream all JSONs from this zip
+        # Step 2: Read the JSON sidecars. Locally each one is read by name. Over ADB they
+        # arrive as one stream (a single call instead of thousands), which is then cut at
+        # the sizes from the listing.
+        sized_json = [(size, name) for size, name in entries if name.endswith(".json")]
         print("  Streaming JSON metadata...", end="", flush=True)
         t = time.time()
+        pairing = "name"
         if use_local:
-            raw_json_bytes = local_stream_all_jsons(zip_source)
+            json_data_map = local_read_jsons(zip_source, json_entries)
+            json_size = sum(size for size, _ in sized_json)
         else:
             raw_json_bytes = adb_stream_all_jsons(remote_zip)
-        json_size = len(raw_json_bytes)
+            json_size = len(raw_json_bytes)
+            json_data_map, pairing = pair_json_stream(raw_json_bytes, sized_json)
         print(f" {format_size(json_size)} ({time.time()-t:.1f}s)")
 
-        # Step 3: Parse concatenated JSON stream
-        print("  Parsing JSON sidecars...", end="", flush=True)
-        t = time.time()
-        json_data_map = parse_concatenated_jsons(raw_json_bytes, json_entries)
-        print(f" {len(json_data_map)}/{len(json_entries)} parsed ({time.time()-t:.1f}s)")
+        # Step 3: Report what could be parsed
+        print(f"  Parsing JSON sidecars... {len(json_data_map)}/{len(json_entries)} parsed")
+        if pairing == "none" and json_entries:
+            print("  NOTE: the sidecar stream could not be matched to the listing, so each sidecar")
+            print("        is read separately. This is slower but cannot mix sidecars up.")
 
         # Index the listing once per zip; sidecar titles settle what names alone cannot
         titles = {
