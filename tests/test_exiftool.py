@@ -14,10 +14,17 @@ from tests.conftest import read_tags
 # --- pure helpers (no exiftool needed) -------------------------------------------------
 
 
-def test_argfile_line_escapes_control_characters():
-    line = fixer._argfile_line("-ImageDescription=one\ntwo\\three\tfour\r\x00")
-    assert line == "#[CSTR]-ImageDescription=one\\ntwo\\\\three\\tfour\\r"
-    assert "\n" not in line
+def test_argfile_line_keeps_every_value_on_one_line():
+    line = fixer._argfile_line("-ImageDescription= one\ntwo\\three\tfour & <five>\r\x00 ")
+    assert line == "-ImageDescription=&#x20;one&#xa;two\\three&#x9;four &#x26; &#x3c;five&#x3e;&#xd;&#x20;"
+    assert "\n" not in line and "\r" not in line
+    assert fixer._argfile_line("-GPSLatitude=-33.5") == "-GPSLatitude=-33.5"
+
+
+def test_argfile_path_line():
+    assert fixer._argfile_path_line("/photos/100% $HOME @home.jpg") == "/photos/100% $HOME @home.jpg"
+    assert fixer._argfile_path_line("/photos/two\nlines.jpg") == "#[CSTR]/photos/two\\nlines.jpg"
+    assert fixer._argfile_path_line("/photos/two\nlines $.jpg") is None
 
 
 def test_parse_output_uses_exit_status_markers():
@@ -61,7 +68,7 @@ def test_multiline_description_is_written_verbatim(tmp_path, jpeg_bytes):
     # read as a separate argument and the caption was cut at the first line break.
     target = tmp_path / "a.jpg"
     target.write_bytes(jpeg_bytes)
-    caption = 'Day one\nline two \\ with "quotes"\tand a tab'
+    caption = 'Day one\nline two \\ with "quotes"\tand a tab, $5 & <tags> for sam@example.invalid'
     args = fixer.build_exiftool_args({"description": caption}, target)
 
     assert fixer.run_exiftool_batch([(target, args)]) == (1, 0)
@@ -90,7 +97,10 @@ def test_caption_lines_cannot_inject_arguments_or_touch_other_files(tmp_path, jp
 
 
 @pytest.mark.exiftool
-@pytest.mark.parametrize("name", ["-leading-dash.jpg", "#hash.jpg", " leading-space.jpg", "naïve ünïcode 写真.jpg"])
+@pytest.mark.parametrize(
+    "name",
+    ["-leading-dash.jpg", "#hash.jpg", " leading-space.jpg", "naïve ünïcode 写真.jpg", "100% $HOME `x` @home &amp; co.jpg"],
+)
 def test_awkward_relative_file_names_are_written(tmp_path, monkeypatch, jpeg_bytes, name):
     # Regression: with a relative path these were read as an option, a comment and a
     # different file name respectively, and nothing was written.
@@ -137,3 +147,31 @@ def test_no_temporary_argfile_is_left_behind(tmp_path, monkeypatch, jpeg_bytes):
     target.write_bytes(jpeg_bytes)
     assert fixer.run_exiftool_batch([(target, ["-Artist=x"])]) == (1, 0)
     assert [p for p in os.listdir(scratch) if p.endswith(".args")] == []
+
+
+@pytest.mark.exiftool
+@pytest.mark.parametrize(
+    "caption",
+    ["cost $5", "$HOME and ${braces}", "sam@example.invalid", "a < b > c & d &amp; e", "&#x41; is not decoded twice",
+     "  spaces kept  ", "it's \"quoted\"", "trailing backslash \\", "#not a comment", "<=not a file", "é 写真 😀"],
+)
+def test_ordinary_punctuation_in_captions_is_written_unchanged(tmp_path, jpeg_bytes, caption):
+    # Regression (found while fixing the injection): ExifTool's #[CSTR] form turns "$" and "@"
+    # into "\\$" and "\\@", so values are sent as HTML entities instead.
+    target = tmp_path / "a.jpg"
+    target.write_bytes(jpeg_bytes)
+    assert fixer.run_exiftool_batch([(target, [f"-ImageDescription={caption}", f"-XMP:PersonInImage={caption}"])]) == (1, 0)
+    tags = read_tags(target, "-IFD0:ImageDescription", "-XMP-iptcExt:PersonInImage")
+    assert tags["IFD0:ImageDescription"] == caption.strip() or tags["IFD0:ImageDescription"] == caption
+    assert tags["XMP-iptcExt:PersonInImage"] == caption
+
+
+@pytest.mark.exiftool
+@pytest.mark.skipif(sys.platform == "win32", reason="line breaks are not valid in Windows file names")
+def test_unsupported_file_name_is_reported_not_guessed(tmp_path, jpeg_bytes):
+    good, odd = tmp_path / "good.jpg", tmp_path / "two\nlines $.jpg"
+    good.write_bytes(jpeg_bytes)
+    odd.write_bytes(jpeg_bytes)
+    results = fixer.run_exiftool_batch_detailed([(odd, ["-Artist=x"]), (good, ["-Artist=x"])])
+    assert results[0] is not None and not results[0].ok and "line break" in results[0].message
+    assert results[1] == fixer.ExifResult(True, "")

@@ -48,6 +48,7 @@ import json
 import math
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -773,31 +774,51 @@ class ExifResult(NamedTuple):
 # Options applied to every file in a batch.
 #   -m                        ignore minor warnings
 #   -overwrite_original       do not leave "_original" backup copies
+#   -E                        decode HTML entities in written values (see _argfile_line)
 #   -charset filename=utf8    file names in the argfile are UTF-8 (needed on Windows)
 #   -api LargeFileSupport=1   allow videos over 4 GiB on older ExifTool releases
-EXIFTOOL_COMMON_ARGS = ["-m", "-overwrite_original", "-charset", "filename=utf8", "-api", "LargeFileSupport=1"]
+EXIFTOOL_COMMON_ARGS = ["-m", "-overwrite_original", "-E", "-charset", "filename=utf8", "-api", "LargeFileSupport=1"]
 EXIFTOOL_TIMEOUT = 600  # seconds per batch
 
 _MARKER = re.compile(r"\{gtmf:(\d+)(?::(\d+|\$\{status\}))?\}")
 
 
 def _argfile_line(arg: str) -> str:
-    """Encode one argument as a single ExifTool argfile line.
+    r"""Encode one ``-TAG=VALUE`` argument as a single ExifTool argfile line.
 
     An argfile holds one argument per line, so a value containing a line break (a
     multi-line caption, for example) would otherwise be split into several arguments,
-    and its later lines would be read as file names or options. The ``#[CSTR]`` prefix
-    makes ExifTool decode backslash escapes, which lets the whole value stay on one line.
-    It also protects values that start with "#" (a comment) or with white space.
+    and its later lines would be read as file names or options. ExifTool is run with
+    ``-E``, which makes it decode HTML character entities in the values it writes, so
+    every character that could break out of the line or be misread is sent as an entity.
+
+    (ExifTool's ``#[CSTR]`` line prefix looks like the obvious tool for this, but it
+    turns every ``$`` and ``@`` into ``\$`` and ``\@``, which corrupts ordinary captions.)
     """
-    escaped = (
-        arg.replace("\\", "\\\\")
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\t", "\\t")
-        .replace("\x00", "")
+    name, separator, value = arg.partition("=")
+    encoded = "".join(
+        f"&#x{ord(char):x};" if char in "&<>\"'" or ord(char) < 0x20 or char == "\x7f" else char
+        for char in value.replace("\x00", "")
     )
-    return "#[CSTR]" + escaped
+    # ExifTool drops one space after "=" and ignores trailing white space
+    if encoded.startswith(" "):
+        encoded = "&#x20;" + encoded[1:]
+    if encoded.endswith(" "):
+        encoded = encoded[:-1] + "&#x20;"
+    return name + separator + encoded
+
+
+def _argfile_path_line(path: str) -> str | None:
+    """Encode a file path as an argfile line, or None if it cannot be passed safely.
+
+    Paths are absolute, so they never start with "-", "#" or white space. A path with a
+    line break needs the ``#[CSTR]`` form, which cannot carry "$" or "@" (see above).
+    """
+    if "\n" not in path and "\r" not in path:
+        return path
+    if "$" in path or "@" in path:
+        return None
+    return "#[CSTR]" + path.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
 
 
 def _split_on_markers(text: str) -> dict[int, tuple[str, str | None]]:
@@ -857,25 +878,34 @@ def run_exiftool_batch_detailed(
         return []
 
     lines: list[str] = []
+    unsupported: set[int] = set()
     for i, (filepath, args) in enumerate(file_args_list):
-        if i:
+        # Absolute path: a relative name starting with "-" would be read as an option.
+        path_line = _argfile_path_line(os.path.abspath(os.fspath(filepath)))
+        if path_line is None:
+            unsupported.add(i)
+            continue
+        if lines:
             lines.append("-execute")
         lines.extend(_argfile_line(a) for a in args)
-        # Absolute path: a relative name starting with "-" would be read as an option.
-        lines.append(_argfile_line(os.path.abspath(os.fspath(filepath))))
+        lines.append(path_line)
         lines.extend(["-echo3", f"{{gtmf:{i}:${{status}}}}", "-echo4", f"{{gtmf:{i}}}"])
-    payload = ("\n".join(lines) + "\n").encode("utf-8", "surrogateescape")
-
-    try:
-        proc = subprocess.run(
-            ["exiftool", "-@", "-", "-common_args", *EXIFTOOL_COMMON_ARGS],
-            input=payload, capture_output=True, timeout=EXIFTOOL_TIMEOUT,
+    results: list[ExifResult | None] = [None] * count
+    if lines:
+        payload = ("\n".join(lines) + "\n").encode("utf-8", "surrogateescape")
+        try:
+            proc = subprocess.run(
+                ["exiftool", "-@", "-", "-common_args", *EXIFTOOL_COMMON_ARGS],
+                input=payload, capture_output=True, timeout=EXIFTOOL_TIMEOUT,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return results
+        results = _parse_exiftool_output(
+            proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace"), count
         )
-    except (subprocess.TimeoutExpired, OSError):
-        return [None] * count
-    return _parse_exiftool_output(
-        proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace"), count
-    )
+    for i in unsupported:
+        results[i] = ExifResult(False, "Error: file name contains a line break together with $ or @")
+    return results
 
 
 def run_exiftool_batch(
@@ -945,7 +975,9 @@ def read_existing_dates(paths: Sequence[str | os.PathLike[str]]) -> dict[str, st
     """
     if not paths:
         return {}
-    lines = [_argfile_line(os.path.abspath(os.fspath(p))) for p in paths]
+    lines = [line for line in (_argfile_path_line(os.path.abspath(os.fspath(p))) for p in paths) if line]
+    if not lines:
+        return {}
     payload = ("\n".join(lines) + "\n").encode("utf-8", "surrogateescape")
     try:
         proc = subprocess.run(
@@ -1151,6 +1183,53 @@ def _same_photo(first: dict[str, Any], second: dict[str, Any]) -> bool:
 # ADB HELPERS
 # ---------------------------------------------------------------------------
 
+class AdbError(OSError):
+    """An adb command could not be run, timed out, or reported failure."""
+
+
+def sh_quote(text: str) -> str:
+    """Quote one argument for the shell on the device.
+
+    ``adb shell`` hands its command line to a POSIX shell on the phone. Paths and file
+    names (zip names come from a directory listing, entry names from inside the zip) are
+    data, so every one of them is quoted: otherwise a space splits the argument and
+    characters such as ``$( )``, backticks or quotes are interpreted by that shell.
+    """
+    return shlex.quote(text)
+
+
+def unzip_literal(entry: str) -> str:
+    """Escape an entry name so ``unzip`` matches it literally instead of as a wildcard pattern."""
+    return re.sub(r"([\\\[\]*?])", r"\\\1", entry)
+
+
+def adb_shell(command: str, *, timeout: int, text: bool = False) -> subprocess.CompletedProcess[Any]:
+    """Run one command line in the device shell. Raises AdbError if adb is missing or times out."""
+    kwargs: dict[str, Any] = {"capture_output": True, "timeout": timeout}
+    if text:
+        kwargs.update(text=True, encoding="utf-8", errors="replace")
+    try:
+        return subprocess.run(["adb", "shell", command], **kwargs)
+    except subprocess.TimeoutExpired as exc:
+        raise AdbError(f"adb did not answer within {timeout} s") from exc
+    except FileNotFoundError as exc:
+        raise AdbError("adb was not found on PATH") from exc
+
+
+def parse_adb_devices(output: str) -> list[str]:
+    """Serial numbers of the devices ``adb devices`` reports as ready.
+
+    Only the state "device" counts. "unauthorized", "offline" and "no permissions"
+    lines are not usable devices, whatever other words they contain.
+    """
+    serials = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device" and not line.startswith(("List of", "*")):
+            serials.append(parts[0])
+    return serials
+
+
 def check_adb():
     """Verify ADB connection to an Android device."""
     try:
@@ -1158,27 +1237,29 @@ def check_adb():
             ["adb", "devices"], capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=10
         )
-        lines = [l.strip() for l in r.stdout.strip().split("\n")[1:] if l.strip()]
-        devices = [l for l in lines if "device" in l and "offline" not in l]
-        if not devices:
-            print("ERROR: No Android device found.")
-            print("  Connect via USB and enable USB Debugging.")
-            sys.exit(1)
-        print(f"  ADB device: {devices[0].split()[0]}")
-        return True
     except FileNotFoundError:
         print("ERROR: ADB not found! Install Android SDK Platform Tools.")
         sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print("ERROR: adb did not answer. Is the adb server running?")
+        sys.exit(1)
+    devices = parse_adb_devices(r.stdout)
+    if not devices:
+        print("ERROR: No Android device found.")
+        print("  Connect via USB and enable USB Debugging.")
+        sys.exit(1)
+    print(f"  ADB device: {devices[0]}")
+    return True
 
 
 def adb_list_zips(remote_dir):
     """List zip files on the Android device."""
-    r = subprocess.run(
-        ["adb", "shell", f"ls -1 {remote_dir}"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
-    )
+    r = adb_shell(f"ls -1 {sh_quote(remote_dir)}", timeout=30, text=True)
     files = [f.strip() for f in r.stdout.strip().split("\n") if f.strip()]
-    return sorted([f for f in files if f.lower().endswith(".zip")])
+    zips = sorted([f for f in files if f.lower().endswith(".zip")])
+    if not zips and r.returncode != 0:
+        raise AdbError(f"could not list {remote_dir} on the device")
+    return zips
 
 
 def adb_get_zip_listing(remote_zip):
@@ -1186,10 +1267,7 @@ def adb_get_zip_listing(remote_zip):
 
     Returns list of (size, name) tuples.
     """
-    r = subprocess.run(
-        ["adb", "shell", f'unzip -l "{remote_zip}"'],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
-    )
+    r = adb_shell(f"unzip -l {sh_quote(remote_zip)}", timeout=120, text=True)
     entries = []
     for line in r.stdout.split("\n"):
         parts = line.strip().split(None, 3)
@@ -1208,12 +1286,7 @@ def adb_stream_all_jsons(remote_zip):
     Returns the raw bytes of all concatenated JSON files.
     Uses 'unzip -p *.json' which is very fast (~0.3s for thousands of JSONs).
     """
-    cmd = f'unzip -p "{remote_zip}" "*.json" 2>/dev/null'
-    r = subprocess.run(
-        ["adb", "shell", cmd],
-        capture_output=True, timeout=300,
-    )
-    return r.stdout
+    return adb_shell(f"unzip -p {sh_quote(remote_zip)} '*.json' 2>/dev/null", timeout=300).stdout
 
 
 def adb_stream_single_json(remote_zip, json_entry):
@@ -1221,12 +1294,8 @@ def adb_stream_single_json(remote_zip, json_entry):
 
     Fallback for when batch parsing has issues.
     """
-    cmd = f'unzip -p "{remote_zip}" "{json_entry}" 2>/dev/null'
-    r = subprocess.run(
-        ["adb", "shell", cmd],
-        capture_output=True, timeout=30,
-    )
-    return r.stdout
+    command = f"unzip -p {sh_quote(remote_zip)} {sh_quote(unzip_literal(json_entry))} 2>/dev/null"
+    return adb_shell(command, timeout=30).stdout
 
 
 def _decode_json_values(raw_bytes: bytes) -> list[Any] | None:
@@ -1520,7 +1589,11 @@ def fix_zip_entries(
                 json_data = json_data_map.get(json_entry)
                 raw = b""
                 if json_data is None and read_sidecar is not None:
-                    raw = read_sidecar(json_entry)  # not in the batch read: read it on its own
+                    try:
+                        raw = read_sidecar(json_entry)  # not in the batch read: read it on its own
+                    except AdbError:
+                        zip_stats["no_result"] += 1  # the device did not answer: try again next run
+                        continue
                     json_data = _loads_object(raw)
                 if json_data is None and not raw:
                     zip_stats["no_json"] += 1
@@ -1666,7 +1739,11 @@ def main() -> None:
         zip_names = local_list_zips(local_dir)
     else:
         print(f"\nListing zips on phone ({args.phone_dir})...")
-        zip_names = adb_list_zips(args.phone_dir)
+        try:
+            zip_names = adb_list_zips(args.phone_dir)
+        except AdbError as exc:
+            print(f"ERROR: {exc}")
+            sys.exit(1)
     if not zip_names:
         print("  No zip files found!")
         sys.exit(1)
@@ -1742,7 +1819,13 @@ def main() -> None:
                 json_size = sum(size for size, _ in sized_json)
                 read_sidecar = partial(_local_read_sidecar, zip_source)
             else:
-                raw_json_bytes = adb_stream_all_jsons(remote_zip)
+                try:
+                    raw_json_bytes = adb_stream_all_jsons(remote_zip)
+                except AdbError as exc:
+                    print(f" FAILED: {exc}")
+                    print("  This zip is left unfinished and will be tried again on the next run.")
+                    unfinished.append(zip_name)
+                    continue
                 json_size = len(raw_json_bytes)
                 json_data_map, pairing = pair_json_stream(raw_json_bytes, sized_json)
                 read_sidecar = partial(adb_stream_single_json, remote_zip)
