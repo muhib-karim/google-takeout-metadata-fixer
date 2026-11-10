@@ -31,6 +31,7 @@ ZIP_NAME = None
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from google_takeout_metadata_fixer import (  # noqa: E402
     EXIFTOOL_BATCH_SIZE,
+    apply_metadata_batch,
     build_exiftool_args,
     find_json_match,
     format_size,
@@ -38,7 +39,6 @@ from google_takeout_metadata_fixer import (  # noqa: E402
     is_media,
     load_progress,
     parse_takeout_json,
-    run_exiftool_batch,
     save_progress,
 )
 
@@ -273,6 +273,17 @@ def batch_extract_jsons(json_entries):
     return json_data_map
 
 
+def _apply(batch, stats, processed_set):
+    """Write one batch of (target, metadata, entry_key) and update the counters."""
+    results = apply_metadata_batch([(target, metadata) for target, metadata, _ in batch])
+    for (_, _, entry_key), result in zip(batch, results):
+        if result.status in ("written", "kept"):
+            stats['fixed'] += 1
+        else:
+            stats['err'] += 1
+        processed_set.add(entry_key)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
@@ -449,14 +460,10 @@ def main():
             processed_set.add(entry_key)
             continue
 
-        exiftool_batch.append((target, et_args, entry_key))
+        exiftool_batch.append((target, metadata, entry_key))
 
         if len(exiftool_batch) >= EXIFTOOL_BATCH_SIZE:
-            ok, err = run_exiftool_batch([(fp, a) for fp, a, _ in exiftool_batch])
-            stats['fixed'] += ok
-            stats['err'] += err
-            for _, _, ek in exiftool_batch:
-                processed_set.add(ek)
+            _apply(exiftool_batch, stats, processed_set)
             exiftool_batch = []
 
             progress['processed_entries'] = list(processed_set)
@@ -477,11 +484,7 @@ def main():
 
     # Flush remaining batch
     if exiftool_batch:
-        ok, err = run_exiftool_batch([(fp, a) for fp, a, _ in exiftool_batch])
-        stats['fixed'] += ok
-        stats['err'] += err
-        for _, _, ek in exiftool_batch:
-            processed_set.add(ek)
+        _apply(exiftool_batch, stats, processed_set)
 
     # Save final progress
     progress['processed_entries'] = list(processed_set)

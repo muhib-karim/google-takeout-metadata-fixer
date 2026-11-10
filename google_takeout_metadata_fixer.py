@@ -46,15 +46,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import time
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -287,56 +288,98 @@ def find_json_match(nameset, media_entry, json_title_index=None):
 # METADATA PARSING
 # ---------------------------------------------------------------------------
 
-def parse_takeout_json(data):
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _timestamp_to_exif(value: Any) -> str | None:
+    """Convert a sidecar epoch timestamp to "YYYY:MM:DD HH:MM:SS" in UTC, or None.
+
+    Zero means "unknown" in Takeout sidecars. Negative values are real dates before 1970
+    (scanned prints, for example), so they are kept. The date is computed by adding to the
+    epoch rather than with ``datetime.fromtimestamp``, which rejects negative values on
+    Windows and raises on out-of-range ones.
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds == 0:
+        return None
+    try:
+        dt = _EPOCH + timedelta(seconds=seconds)
+    except OverflowError:
+        return None
+    return f"{dt.year:04d}:{dt.month:02d}:{dt.day:02d} {dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
+
+
+def _finite_number(value: Any) -> float | None:
+    """Return value if it is a real, finite number (bool excluded), else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def parse_takeout_json(data: Any) -> dict[str, Any]:
     """Extract all usable metadata from a Google Takeout JSON sidecar.
 
     Returns dict with keys: datetime, latitude, longitude, altitude,
     description, people, title, favorited
+
+    Sidecars are untrusted input: a field with an unexpected type or an impossible
+    value is skipped, never raised on, so one odd sidecar cannot abort a run.
     """
-    metadata = {}
+    metadata: dict[str, Any] = {}
+    if not isinstance(data, dict):
+        return metadata
 
     # Timestamp: prefer photoTakenTime, fall back to creationTime
     for time_key in ("photoTakenTime", "creationTime"):
-        if time_key in data and "datetime" not in metadata:
-            ts_str = data[time_key].get("timestamp", "0")
-            try:
-                ts = int(ts_str)
-            except (ValueError, TypeError):
-                continue
-            if ts > 0:
-                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                metadata["datetime"] = dt.strftime("%Y:%m:%d %H:%M:%S")
+        block = data.get(time_key)
+        if "datetime" not in metadata and isinstance(block, dict):
+            text = _timestamp_to_exif(block.get("timestamp"))
+            if text:
+                metadata["datetime"] = text
 
-    # GPS coordinates
+    # GPS coordinates. Takeout writes 0.0/0.0 when there is no location.
     for geo_key in ("geoData", "geoDataExif"):
-        if geo_key in data and "latitude" not in metadata:
-            geo = data[geo_key]
-            lat = geo.get("latitude", 0)
-            lng = geo.get("longitude", 0)
-            if lat != 0 or lng != 0:
-                metadata["latitude"] = lat
-                metadata["longitude"] = lng
-                metadata["altitude"] = geo.get("altitude", 0)
+        geo = data.get(geo_key)
+        if "latitude" in metadata or not isinstance(geo, dict):
+            continue
+        lat = _finite_number(geo.get("latitude"))
+        lng = _finite_number(geo.get("longitude"))
+        if lat is None or lng is None or (lat == 0 and lng == 0):
+            continue
+        if abs(lat) > 90 or abs(lng) > 180:
+            continue
+        metadata["latitude"] = lat
+        metadata["longitude"] = lng
+        metadata["altitude"] = _finite_number(geo.get("altitude")) or 0
 
     # Description
-    desc = data.get("description", "")
-    if desc and desc.strip():
+    desc = data.get("description")
+    if isinstance(desc, str) and desc.strip():
         metadata["description"] = desc.strip()
 
     # People tags
-    people = data.get("people", [])
-    if people:
-        names = [p.get("name", "") for p in people if p.get("name")]
+    people = data.get("people")
+    if isinstance(people, list):
+        names = [
+            p["name"].strip() for p in people
+            if isinstance(p, dict) and isinstance(p.get("name"), str) and p["name"].strip()
+        ]
         if names:
             metadata["people"] = names
 
     # Favorite status
-    if data.get("favorited"):
+    if data.get("favorited") is True:
         metadata["favorited"] = True
 
     # Title (for reference)
-    if data.get("title"):
-        metadata["title"] = data["title"]
+    title = data.get("title")
+    if isinstance(title, str) and title:
+        metadata["title"] = title
 
     return metadata
 
@@ -351,24 +394,45 @@ def _format_number(value: float) -> str:
     return "0" if text in ("", "-0") else text
 
 
-def build_exiftool_args(metadata, filepath):
-    """Build exiftool arguments to embed all metadata into a file."""
-    args = []
-    is_video = Path(filepath).suffix.lower() in VIDEO_EXTENSIONS
+def is_video(name: str | os.PathLike[str]) -> bool:
+    return Path(name).suffix.lower() in VIDEO_EXTENSIONS
 
-    if "datetime" in metadata:
+
+def build_exiftool_args(
+    metadata: dict[str, Any], filepath: str | os.PathLike[str], *, write_dates: bool = True
+) -> list[str]:
+    """Build exiftool arguments to embed all metadata into a file.
+
+    ``metadata["datetime"]`` is a UTC wall-clock time. With ``write_dates=False`` the
+    date tags are left out (used when the file already holds a consistent capture time).
+    """
+    args: list[str] = []
+
+    if "datetime" in metadata and write_dates:
         dt = metadata["datetime"]
-        args.extend([
-            f"-DateTimeOriginal={dt}",
-            f"-CreateDate={dt}",
-            f"-ModifyDate={dt}",
-        ])
-        if is_video:
+        if is_video(filepath):
+            # QuickTime date fields are UTC by specification. DateTimeOriginal is stored as
+            # text with a zone; without an explicit one ExifTool appends the zone of the
+            # machine it runs on, which would make the result depend on where it is run.
             args.extend([
+                f"-DateTimeOriginal={dt}+00:00",
+                f"-CreateDate={dt}",
+                f"-ModifyDate={dt}",
                 f"-TrackCreateDate={dt}",
                 f"-TrackModifyDate={dt}",
                 f"-MediaCreateDate={dt}",
                 f"-MediaModifyDate={dt}",
+            ])
+        else:
+            # EXIF dates carry no zone, so the UTC offset is written next to them.
+            # Without it a stale OffsetTime tag would shift the instant.
+            args.extend([
+                f"-DateTimeOriginal={dt}",
+                f"-CreateDate={dt}",
+                f"-ModifyDate={dt}",
+                "-OffsetTimeOriginal=+00:00",
+                "-OffsetTimeDigitized=+00:00",
+                "-OffsetTime=+00:00",
             ])
 
     if "latitude" in metadata:
@@ -527,6 +591,149 @@ def run_exiftool_batch(
     results = run_exiftool_batch_detailed(file_args_list)
     updated = sum(1 for r in results if r is not None and r.ok)
     return updated, len(results) - updated
+
+
+# ---------------------------------------------------------------------------
+# DATE POLICY AND BATCH APPLICATION
+#
+# A sidecar stores the capture instant in UTC. A photo that still has its camera
+# metadata stores the *local* wall-clock time, usually with the zone offset in a
+# separate tag. Overwriting that with UTC loses the local time and, when the old
+# offset tag stays behind, moves the instant. So a photo's embedded capture time
+# is kept whenever it shows the same instant as the sidecar up to a time-zone
+# offset, and replaced only when it is missing or really different.
+# ---------------------------------------------------------------------------
+
+_EXIF_DATETIME = re.compile(r"^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})")
+_ZONE_STEP = 15 * 60          # every real time zone is a multiple of 15 minutes
+_ZONE_TOLERANCE = 2           # seconds of rounding allowed
+_MIN_ZONE, _MAX_ZONE = -12 * 3600, 14 * 3600
+
+
+def _parse_exif_datetime(text: str | None) -> datetime | None:
+    match = _EXIF_DATETIME.match(text) if isinstance(text, str) else None
+    if not match:
+        return None
+    try:
+        return datetime(*(int(g) for g in match.groups()))  # type: ignore[arg-type]
+    except ValueError:
+        return None
+
+
+def camera_time_matches(existing: str | None, sidecar_utc: str) -> bool:
+    """True when an embedded capture time is the sidecar instant shifted by a time zone.
+
+    ``existing`` is the file's DateTimeOriginal (local wall-clock time) and ``sidecar_utc``
+    the sidecar time in UTC, both as "YYYY:MM:DD HH:MM:SS". They match when they differ
+    by a whole number of quarter hours between -12:00 and +14:00.
+    """
+    local, utc = _parse_exif_datetime(existing), _parse_exif_datetime(sidecar_utc)
+    if local is None or utc is None:
+        return False
+    delta = (local - utc).total_seconds()
+    if not _MIN_ZONE - _ZONE_TOLERANCE <= delta <= _MAX_ZONE + _ZONE_TOLERANCE:
+        return False
+    return abs(delta - round(delta / _ZONE_STEP) * _ZONE_STEP) <= _ZONE_TOLERANCE
+
+
+def _path_key(path: str | os.PathLike[str]) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def read_existing_dates(paths: Sequence[str | os.PathLike[str]]) -> dict[str, str]:
+    """Read the embedded DateTimeOriginal of each file with one ExifTool call.
+
+    Returns {normalised absolute path: date text} for the files that have one. Files that
+    cannot be read are simply absent, as is everything if ExifTool is unavailable.
+    """
+    if not paths:
+        return {}
+    lines = [_argfile_line(os.path.abspath(os.fspath(p))) for p in paths]
+    payload = ("\n".join(lines) + "\n").encode("utf-8", "surrogateescape")
+    try:
+        proc = subprocess.run(
+            ["exiftool", "-json", "-charset", "filename=utf8", "-api", "LargeFileSupport=1",
+             "-DateTimeOriginal", "-@", "-"],
+            input=payload, capture_output=True, timeout=EXIFTOOL_TIMEOUT,
+        )
+        records = json.loads(proc.stdout.decode("utf-8", "replace") or "[]")
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return {}
+    found: dict[str, str] = {}
+    for record in records if isinstance(records, list) else []:
+        if isinstance(record, dict) and isinstance(record.get("DateTimeOriginal"), str):
+            found[_path_key(str(record.get("SourceFile", "")))] = record["DateTimeOriginal"]
+    return found
+
+
+class ApplyResult(NamedTuple):
+    """Outcome of applying one file's metadata.
+
+    status is "written" (ExifTool updated the file), "kept" (nothing needed writing),
+    "failed" (ExifTool reported an error for this file) or "unknown" (no result).
+    """
+
+    status: str
+    message: str = ""
+    date_kept: bool = False
+
+
+def apply_metadata_batch(
+    items: Sequence[tuple[str | os.PathLike[str], dict[str, Any]]], *, overwrite_dates: bool = False
+) -> list[ApplyResult]:
+    """Write parsed sidecar metadata into a batch of files. One result per item, in order.
+
+    Unless ``overwrite_dates`` is set, a photo's embedded capture time is read first and
+    kept when it is consistent with the sidecar (see :func:`camera_time_matches`).
+    Videos always get the sidecar time, because their date fields are UTC by specification.
+    """
+    existing: dict[str, str] = {}
+    if not overwrite_dates:
+        existing = read_existing_dates(
+            [path for path, metadata in items if "datetime" in metadata and not is_video(path)]
+        )
+
+    plans: list[tuple[list[str], bool]] = []
+    for path, metadata in items:
+        keep = (
+            not overwrite_dates
+            and "datetime" in metadata
+            and not is_video(path)
+            and camera_time_matches(existing.get(_path_key(path)), metadata["datetime"])
+        )
+        plans.append((build_exiftool_args(metadata, path, write_dates=not keep), keep))
+
+    to_run = [(path, args) for (path, _), (args, _) in zip(items, plans) if args]
+    results = iter(run_exiftool_batch_detailed(to_run))
+    outcome: list[ApplyResult] = []
+    for args, keep in plans:
+        if not args:
+            outcome.append(ApplyResult("kept", "", keep))
+            continue
+        result = next(results)
+        if result is None:
+            outcome.append(ApplyResult("unknown", "ExifTool gave no result for this file", keep))
+        elif result.ok:
+            outcome.append(ApplyResult("written", "", keep))
+        else:
+            outcome.append(ApplyResult("failed", result.message, keep))
+    return outcome
+
+
+def _flush_batch(batch, zip_stats, stats, processed_set, overwrite_dates):
+    """Apply one batch of (target, metadata, entry_key) and update the counters."""
+    results = apply_metadata_batch([(target, metadata) for target, metadata, _ in batch],
+                                   overwrite_dates=overwrite_dates)
+    for (_, _, entry_key), result in zip(batch, results):
+        if result.status == "written":
+            zip_stats["fixed"] += 1
+        elif result.status == "kept":
+            zip_stats["unchanged"] += 1
+        else:
+            zip_stats["err"] += 1
+        if result.date_kept:
+            stats["dates_kept"] += 1
+        processed_set.add(entry_key)
 
 
 # ---------------------------------------------------------------------------
@@ -735,6 +942,11 @@ def main():
         "--dry-run", action="store_true",
         help="Show what would be done without modifying any files"
     )
+    parser.add_argument(
+        "--overwrite-dates", action="store_true",
+        help="Always write the sidecar date. By default a photo's embedded capture time is "
+             "kept when it shows the same instant as the sidecar in another time zone"
+    )
     args = parser.parse_args()
 
     use_local = args.local_zips is not None
@@ -807,6 +1019,8 @@ def main():
         "has_gps": 0,
         "has_description": 0,
         "has_people": 0,
+        "dates_kept": 0,
+        "unchanged": 0,
     }
 
     for zi, zip_name in enumerate(zip_names, 1):
@@ -861,7 +1075,7 @@ def main():
         print(f"  Processing {len(media_entries)} media files...")
         zip_start = time.time()
         exiftool_batch = []
-        zip_stats = {"fixed": 0, "no_json": 0, "no_match": 0, "no_meta": 0, "err": 0, "skip": 0}
+        zip_stats = {"fixed": 0, "unchanged": 0, "no_json": 0, "no_match": 0, "no_meta": 0, "err": 0, "skip": 0}
         fallback_singles = []
 
         for i, media_entry in enumerate(media_entries, 1):
@@ -933,17 +1147,11 @@ def main():
                 processed_set.add(entry_key)
                 continue
 
-            exiftool_batch.append((target, et_args, entry_key))
+            exiftool_batch.append((target, metadata, entry_key))
 
             # Run batch when full
             if len(exiftool_batch) >= EXIFTOOL_BATCH_SIZE:
-                ok, err = run_exiftool_batch(
-                    [(fp, a) for fp, a, _ in exiftool_batch]
-                )
-                zip_stats["fixed"] += ok
-                zip_stats["err"] += err
-                for _, _, ek in exiftool_batch:
-                    processed_set.add(ek)
+                _flush_batch(exiftool_batch, zip_stats, stats, processed_set, args.overwrite_dates)
                 exiftool_batch = []
 
                 # Save progress periodically
@@ -966,13 +1174,7 @@ def main():
 
         # Flush remaining batch
         if exiftool_batch:
-            ok, err = run_exiftool_batch(
-                [(fp, a) for fp, a, _ in exiftool_batch]
-            )
-            zip_stats["fixed"] += ok
-            zip_stats["err"] += err
-            for _, _, ek in exiftool_batch:
-                processed_set.add(ek)
+            _flush_batch(exiftool_batch, zip_stats, stats, processed_set, args.overwrite_dates)
 
         # Handle fallback singles (JSONs that failed batch parsing)
         if fallback_singles:
@@ -1002,28 +1204,16 @@ def main():
 
                 et_args = build_exiftool_args(metadata, target)
                 if et_args and not args.dry_run:
-                    fb_batch.append((target, et_args, entry_key))
+                    fb_batch.append((target, metadata, entry_key))
                 else:
                     processed_set.add(entry_key)
 
                 if len(fb_batch) >= EXIFTOOL_BATCH_SIZE:
-                    ok, err = run_exiftool_batch(
-                        [(fp, a) for fp, a, _ in fb_batch]
-                    )
-                    zip_stats["fixed"] += ok
-                    zip_stats["err"] += err
-                    for _, _, ek in fb_batch:
-                        processed_set.add(ek)
+                    _flush_batch(fb_batch, zip_stats, stats, processed_set, args.overwrite_dates)
                     fb_batch = []
 
             if fb_batch:
-                ok, err = run_exiftool_batch(
-                    [(fp, a) for fp, a, _ in fb_batch]
-                )
-                zip_stats["fixed"] += ok
-                zip_stats["err"] += err
-                for _, _, ek in fb_batch:
-                    processed_set.add(ek)
+                _flush_batch(fb_batch, zip_stats, stats, processed_set, args.overwrite_dates)
 
         # Save progress (never during a dry run, otherwise a later real run
         # would skip every entry the dry run "processed")
@@ -1034,6 +1224,7 @@ def main():
 
         elapsed = time.time() - zip_start
         stats["fixed"] += zip_stats["fixed"]
+        stats["unchanged"] += zip_stats["unchanged"]
         stats["no_json"] += zip_stats["no_json"]
         stats["no_output_match"] += zip_stats["no_match"]
         stats["no_metadata"] += zip_stats["no_meta"]
@@ -1043,7 +1234,7 @@ def main():
         print(
             f"  DONE: fixed={zip_stats['fixed']} no_json={zip_stats['no_json']} "
             f"no_match={zip_stats['no_match']} skip={zip_stats['skip']} "
-            f"err={zip_stats['err']} ({format_time(elapsed)})"
+            f"err={zip_stats['err']} unchanged={zip_stats['unchanged']} ({format_time(elapsed)})"
         )
         sys.stdout.flush()
 
@@ -1053,6 +1244,7 @@ def main():
     print(f"  METADATA FIX COMPLETE ({format_time(elapsed)})")
     print(f"{'=' * 65}")
     print(f"  Files with metadata fixed:  {stats['fixed']}")
+    print(f"  Already correct, unchanged: {stats['unchanged']}")
     print(f"  Already processed (skip):   {stats['already_done']}")
     print(f"  No JSON sidecar found:      {stats['no_json']}")
     print(f"  No matching output file:    {stats['no_output_match']}")
@@ -1063,6 +1255,7 @@ def main():
     print(f"  With GPS coordinates:       {stats['has_gps']}")
     print(f"  With descriptions:          {stats['has_description']}")
     print(f"  With people tags:           {stats['has_people']}")
+    print(f"  Dates kept (camera time):   {stats['dates_kept']}")
     print(f"{'=' * 65}")
 
     if args.dry_run:
