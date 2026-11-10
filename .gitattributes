@@ -1,0 +1,9 @@
+# Keep LF line endings in the repository and in every checkout, on every platform.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.heic binary
+*.mp4 binary
+*.zip binary

@@ -1,14 +1,69 @@
-# Tooling configuration only; the scripts are run directly with `python <script>.py`.
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "google-takeout-metadata-fixer"
+version = "1.1.0"
+description = "Restore dates, GPS, descriptions and people tags from Google Takeout JSON sidecars."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Muhib Karim" }]
+keywords = ["google-takeout", "google-photos", "exif", "metadata", "exiftool"]
+classifiers = [
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Topic :: Multimedia :: Graphics",
+]
+# The fixer, extractor, copy and recovery tools use only the standard library.
+# The optional downloader's dependencies are listed in requirements.txt.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/muhib-karim/google-takeout-metadata-fixer"
+Issues = "https://github.com/muhib-karim/google-takeout-metadata-fixer/issues"
+
+# The scripts are run directly with `python <script>.py`; this only keeps `pip install .` working.
+[tool.setuptools]
+py-modules = [
+    "google_takeout_metadata_fixer",
+    "extract_takeout_media",
+    "recover_takeout_zip_metadata",
+    "adb_resumable_copy",
+    "google_photos_downloader",
+]
 
 [tool.ruff]
-target-version = "py39"
+target-version = "py310"
 line-length = 120
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "B", "I"]
+select = ["E", "F", "W", "B", "I", "UP"]
 ignore = ["E501", "E741"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["."]
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[[tool.mypy.overrides]]
+module = ["google_auth_oauthlib.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = "-ra"
+addopts = "-ra --strict-markers"
+markers = [
+    "exiftool: calls the real exiftool binary (skipped when it is not installed)",
+]

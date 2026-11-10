@@ -33,10 +33,36 @@ def authenticate():
             flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
 
-        with open(TOKEN_FILE, "w") as f:
-            f.write(creds.to_json())
+        save_token(creds)
 
     return creds
+
+
+def save_token(creds):
+    """Store the OAuth token readable by the current user only.
+
+    The file holds a refresh token, which gives lasting access to the account, so it must
+    not be created with the default (world-readable) permissions.
+    """
+    fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(creds.to_json())
+    try:
+        os.chmod(TOKEN_FILE, 0o600)  # also tighten a file left by an earlier version
+    except OSError:
+        pass
+
+
+def safe_filename(name):
+    """Reduce a file name supplied by the API to its final component.
+
+    The name is remote data: "../x.jpg" or an absolute path must not be able to place
+    the download outside the download directory.
+    """
+    base = os.path.basename(str(name).replace("\\", "/"))
+    if base in ("", ".", ".."):
+        raise ValueError(f"unusable file name from the API: {name!r}")
+    return base
 
 
 def get_headers(creds):
@@ -63,7 +89,7 @@ def list_media_items(creds, page_token=None):
 
 def download_item(item, download_dir):
     """Download a single media item (photo or video)."""
-    filename = item["filename"]
+    filename = safe_filename(item["filename"])
     filepath = download_dir / filename
 
     # Skip if already downloaded
@@ -120,8 +146,7 @@ def main():
             if e.response.status_code == 401:
                 print("Token expired, refreshing...")
                 creds.refresh(Request())
-                with open(TOKEN_FILE, "w") as f:
-                    f.write(creds.to_json())
+                save_token(creds)
                 continue
             raise
 

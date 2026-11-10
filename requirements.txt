@@ -1,3 +1,5 @@
-requests>=2.32.0
+# Only needed for the optional google_photos_downloader.py.
+# The other tools use the Python standard library alone.
+requests>=2.33.0
 google-auth>=2.35.0
 google-auth-oauthlib>=1.2.0

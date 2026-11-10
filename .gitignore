@@ -1,5 +1,10 @@
 # Python
 __pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
 *.py[cod]
 *$py.class
 *.so
@@ -10,6 +15,8 @@ env/
 # Progress/state files
 fix_metadata_progress.json
 processing_progress.json
+*.journal
+*.corrupt-*
 fix_metadata_log.txt
 fix_metadata_log_rerun.txt
 fix_zip3_log.txt
