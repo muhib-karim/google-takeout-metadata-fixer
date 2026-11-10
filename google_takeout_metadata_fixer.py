@@ -53,8 +53,11 @@ import subprocess
 import sys
 import time
 import unicodedata
-from collections.abc import Iterable, Mapping, Sequence
+import zipfile
+from collections import Counter
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -99,25 +102,159 @@ def format_time(seconds):
     return f"{h}h {m}m"
 
 
-def load_progress():
-    if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE, "r") as f:
-            return json.load(f)
+def _fresh_progress() -> dict[str, Any]:
     return {"completed_zips": [], "processed_entries": []}
 
 
-def save_progress(progress):
+def load_progress(quarantine: bool = True) -> dict[str, Any]:
+    """Load the progress file from the current directory.
+
+    A file that cannot be read or parsed (a write cut short by a crash, for example) is
+    moved aside as ``<name>.corrupt-<time>`` and a fresh state is returned, so a damaged
+    file costs a re-run instead of a traceback. With ``quarantine=False`` the damaged file
+    is left where it is.
+    """
+    if not os.path.exists(PROGRESS_FILE):
+        return _fresh_progress()
+    try:
+        with open(PROGRESS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("progress file does not hold a JSON object")
+    except (OSError, ValueError) as exc:
+        print(f"  WARNING: {PROGRESS_FILE} could not be read ({exc}).")
+        if quarantine:
+            aside = f"{PROGRESS_FILE}.corrupt-{int(time.time())}"
+            try:
+                os.replace(PROGRESS_FILE, aside)
+                print(f"           It was moved to {aside}; starting with empty progress.")
+            except OSError:
+                print("           Starting with empty progress.")
+        return _fresh_progress()
+    return data
+
+
+def save_progress(progress: dict[str, Any]) -> None:
     for _attempt in range(5):
         try:
             tmp = PROGRESS_FILE + ".tmp"
-            with open(tmp, "w") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(progress, f)
             os.replace(tmp, PROGRESS_FILE)
             return
         except PermissionError:
             time.sleep(1)
-    with open(PROGRESS_FILE, "w") as f:
+    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
         json.dump(progress, f)
+
+
+class ProgressStore:
+    """Resume state for a run: what happened to each zip entry, and which zips are finished.
+
+    Every zip entry ends in one of three states:
+
+    * processed: it has a final outcome (written, no sidecar, nothing to write).
+      It is never looked at again.
+    * failed:    ExifTool reported an error for its file. It is remembered with the message
+                 and retried only when asked to (``--retry-failed``).
+    * neither:   no result was obtained (timeout, crash, interrupt). It is retried on the
+                 next run, and its zip is not marked completed.
+
+    The state lives in the JSON progress file. Rewriting that file after every batch would
+    mean megabytes per write on a large library, so outcomes are appended to a journal next
+    to it as they happen and folded into the JSON file by :meth:`checkpoint`. A run that is
+    killed outright is recovered from the journal.
+    """
+
+    def __init__(self, *, dry_run: bool = False) -> None:
+        self.dry_run = dry_run
+        self.journal_path = PROGRESS_FILE + ".journal"
+        data = load_progress(quarantine=not dry_run)
+        self.extra = {k: v for k, v in data.items()
+                      if k not in ("completed_zips", "processed_entries", "failed_entries", "targets")}
+        self.completed_zips: list[str] = [z for z in _as_list(data.get("completed_zips")) if isinstance(z, str)]
+        self.processed: set[str] = {e for e in _as_list(data.get("processed_entries")) if isinstance(e, str)}
+        self.failed: dict[str, str] = {
+            str(k): str(v) for k, v in _as_dict(data.get("failed_entries")).items()
+        }
+        self.targets: dict[str, str] = {
+            str(k): v for k, v in _as_dict(data.get("targets")).items() if isinstance(v, str)
+        }
+        self._journal: Any = None
+        self._replay_journal()
+
+    def _replay_journal(self) -> None:
+        try:
+            with open(self.journal_path, encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            return
+        for line in lines:
+            try:
+                record = json.loads(line)
+                self._apply(record["e"], record["s"], record.get("m", ""), record.get("t"))
+            except (ValueError, KeyError, TypeError):
+                continue  # a line cut short by the crash that left the journal behind
+
+    def _apply(self, entry_key: str, status: str, message: str, target: str | None) -> None:
+        if status == "done":
+            self.processed.add(entry_key)
+            self.failed.pop(entry_key, None)
+        elif status == "failed":
+            self.processed.discard(entry_key)
+            self.failed[entry_key] = message
+        if isinstance(target, str):
+            self.targets[entry_key] = target
+
+    def record(self, entry_key: str, status: str, *, message: str = "", target: str | None = None) -> None:
+        """Record the outcome of one entry: status is "done" or "failed"."""
+        self._apply(entry_key, status, message, target)
+        if self.dry_run:
+            return
+        if self._journal is None:
+            self._journal = open(self.journal_path, "a", encoding="utf-8")  # noqa: SIM115
+        record = {"e": entry_key, "s": status}
+        if message:
+            record["m"] = message
+        if target:
+            record["t"] = target
+        self._journal.write(json.dumps(record) + "\n")
+        self._journal.flush()
+
+    def has_failed(self, zip_name: str) -> bool:
+        prefix = f"{zip_name}::"
+        return any(key.startswith(prefix) for key in self.failed)
+
+    def complete_zip(self, zip_name: str) -> None:
+        if zip_name not in self.completed_zips:
+            self.completed_zips.append(zip_name)
+
+    def checkpoint(self) -> None:
+        """Fold everything recorded so far into the progress file and drop the journal."""
+        if self.dry_run:
+            return
+        save_progress({
+            **self.extra,
+            "completed_zips": self.completed_zips,
+            "processed_entries": sorted(self.processed),
+            "failed_entries": self.failed,
+            "targets": self.targets,
+        })
+        if self._journal is not None:
+            self._journal.close()
+            self._journal = None
+        try:
+            os.remove(self.journal_path)
+        except OSError:
+            pass
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _as_dict(value: Any) -> dict[Any, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 # ---------------------------------------------------------------------------
@@ -879,20 +1016,134 @@ def apply_metadata_batch(
     return outcome
 
 
-def _flush_batch(batch, zip_stats, stats, processed_set, overwrite_dates):
-    """Apply one batch of (target, metadata, entry_key) and update the counters."""
-    results = apply_metadata_batch([(target, metadata) for target, metadata, _ in batch],
-                                   overwrite_dates=overwrite_dates)
-    for (_, _, entry_key), result in zip(batch, results):
-        if result.status == "written":
-            zip_stats["fixed"] += 1
-        elif result.status == "kept":
-            zip_stats["unchanged"] += 1
-        else:
-            zip_stats["err"] += 1
-        if result.date_kept:
-            stats["dates_kept"] += 1
-        processed_set.add(entry_key)
+# ---------------------------------------------------------------------------
+# WHICH OUTPUT FILE BELONGS TO A ZIP ENTRY
+#
+# Output folders are flat, so two zip entries with the same file name (the same camera
+# counter in two years, or one photo listed in two albums) compete for one name. An
+# extractor that keeps both writes the second as "name_1.jpg". Matching on the name alone
+# would write one photo's metadata onto the other, so a file is only used when something
+# identifies it: a target recorded by an earlier run, the exact size of the zip entry
+# (an untouched file), or a capture time already in the file that agrees with the sidecar.
+# When nothing identifies it, the entry is reported as ambiguous and left alone.
+# ---------------------------------------------------------------------------
+
+_RENAMED_COPY = re.compile(r"^(.*)_(\d+)$")
+_DATE_PREREAD = 1000  # files whose dates are read ahead in one ExifTool call
+
+
+class TargetResolver:
+    """Finds the file in the output folder that a zip entry's metadata should be written to."""
+
+    def __init__(self, output_dir: Path, store: ProgressStore | None = None) -> None:
+        self.files: dict[str, Path] = {
+            f.name: f for f in sorted(output_dir.iterdir()) if f.is_file() and is_media(f.name)
+        }
+        # "IMG_1.jpg" -> [IMG_1_1.jpg, IMG_1_2.jpg, ...]: copies renamed on a name clash
+        self.renamed: dict[str, list[Path]] = {}
+        numbered: dict[str, list[tuple[int, Path]]] = {}
+        for name, path in self.files.items():
+            stem, suffix = os.path.splitext(name)
+            match = _RENAMED_COPY.match(stem)
+            if match:
+                numbered.setdefault(match.group(1) + suffix, []).append((int(match.group(2)), path))
+        for name, copies in numbered.items():
+            self.renamed[name] = [path for _, path in sorted(copies)]
+        self.claims: dict[str, str] = {}                 # file name -> entry key that owns it
+        self.applied: dict[str, dict[str, Any]] = {}     # file name -> metadata written this run
+        for entry_key, name in (store.targets if store else {}).items():
+            self.claims.setdefault(name, entry_key)
+        self._dates: dict[str, str | None] = {}
+        self._contested: list[Path] = []
+        self._same_name: Counter[str] = Counter()
+        self._zip_names: set[str] = set()
+
+    def __len__(self) -> int:
+        return len(self.files)
+
+    def start_zip(self, media_entries: Iterable[str]) -> None:
+        """Tell the resolver which media entries the zip about to be processed holds."""
+        basenames = [_split_entry(entry)[1] for entry in media_entries]
+        self._same_name = Counter(basenames)
+        self._zip_names = set(basenames)
+        self._contested = [
+            path for name in sorted(self._zip_names)
+            if self._same_name[name] > 1 or name in self.renamed
+            for path in self.candidates(name)
+        ]
+
+    def candidates(self, filename: str) -> list[Path]:
+        """Output files that could hold this entry: the name itself, then its renamed copies."""
+        found = [self.files[filename]] if filename in self.files else []
+        return found + self.renamed.get(filename, [])
+
+    def _existing_date(self, path: Path) -> str | None:
+        key = _path_key(path)
+        if key not in self._dates:
+            # Read this file together with other contested files of the zip: one ExifTool
+            # call for many files instead of one call each.
+            batch = [path] + [p for p in self._contested if _path_key(p) not in self._dates][:_DATE_PREREAD]
+            found = read_existing_dates(batch)
+            for p in batch:
+                self._dates[_path_key(p)] = found.get(_path_key(p))
+        return self._dates[key]
+
+    def resolve(self, entry_key: str, filename: str, size: int, metadata: dict[str, Any]) -> tuple[Path | None, str]:
+        """Return (file, "ok"), (None, "no_match") or (None, "ambiguous")."""
+        candidates = self.candidates(filename)
+        if not candidates:
+            return None, "no_match"
+        for path in candidates:
+            if self.claims.get(path.name) == entry_key:
+                return path, "ok"
+        free = [path for path in candidates if path.name not in self.claims]
+        exact = self.files.get(filename)
+        single_entry = self._same_name[filename] <= 1
+
+        # The ordinary case needs no evidence: one entry and one file with this name.
+        if single_entry and len(candidates) == 1 and free:
+            if candidates[0] is exact or candidates[0].name not in self._zip_names:
+                return candidates[0], "ok"
+
+        # An untouched file has exactly the size recorded in the zip.
+        for path in free:
+            try:
+                if path.stat().st_size == size:
+                    return path, "ok"
+            except OSError:
+                continue
+
+        # The same photo listed twice (two albums): its file already got this very metadata.
+        for path in candidates:
+            if path.name in self.applied and _same_photo(self.applied[path.name], metadata):
+                return path, "ok"
+
+        # A capture time already in the file that agrees with this sidecar.
+        sidecar_time = metadata.get("datetime")
+        if sidecar_time:
+            unwritten = [path for path in candidates if path.name not in self.applied]
+            agreeing = [path for path in unwritten if camera_time_matches(self._existing_date(path), sidecar_time)]
+            agreeing.sort(key=lambda path: path.name in self.claims)  # unclaimed files first
+            if agreeing:
+                return agreeing[0], "ok"
+
+        if single_entry:
+            if exact is not None and exact in free:
+                return exact, "ok"
+            if len(free) == 1 and free[0].name not in self._zip_names:
+                return free[0], "ok"
+        return None, "ambiguous"
+
+    def claim(self, entry_key: str, path: Path, metadata: dict[str, Any]) -> None:
+        self.claims.setdefault(path.name, entry_key)
+        self.applied[path.name] = metadata
+
+
+def _same_photo(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    """Two sidecars describe the same photo when their capture times are equal."""
+    if "datetime" in first and "datetime" in second:
+        return bool(first["datetime"] == second["datetime"])
+    return first == second
 
 
 # ---------------------------------------------------------------------------
@@ -1129,7 +1380,6 @@ def local_get_zip_listing(zip_path):
 
     Returns list of (size, name) tuples.
     """
-    import zipfile
     entries = []
     with zipfile.ZipFile(zip_path, "r") as zf:
         for info in zf.infolist():
@@ -1143,7 +1393,6 @@ def local_stream_all_jsons(zip_path):
 
     Returns the raw bytes of all concatenated JSON files.
     """
-    import zipfile
     chunks = []
     with zipfile.ZipFile(zip_path, "r") as zf:
         for info in zf.infolist():
@@ -1158,7 +1407,6 @@ def local_read_jsons(zip_path: str | os.PathLike[str], names: Iterable[str]) -> 
     Reading by name cannot pair a sidecar with the wrong name. Entries that are missing,
     unreadable or not a JSON object are left out.
     """
-    import zipfile
     found: dict[str, dict[str, Any]] = {}
     with zipfile.ZipFile(zip_path, "r") as zf:
         for name in names:
@@ -1171,14 +1419,168 @@ def local_read_jsons(zip_path: str | os.PathLike[str], names: Iterable[str]) -> 
     return found
 
 
+def _local_read_sidecar(zip_path: str, json_entry: str) -> bytes:
+    """Read one sidecar from a local zip; empty bytes if it cannot be read."""
+    try:
+        return local_stream_single_json(zip_path, json_entry)
+    except (KeyError, OSError, zipfile.BadZipFile, RuntimeError):
+        return b""
+
+
 def local_stream_single_json(zip_path, json_entry):
     """Read a single JSON file from a local zip."""
-    import zipfile
     with zipfile.ZipFile(zip_path, "r") as zf:
         return zf.read(json_entry)
 
 
-def main():
+class Options(NamedTuple):
+    dry_run: bool = False
+    overwrite_dates: bool = False
+    retry_failed: bool = False
+
+
+def new_zip_stats() -> dict[str, Any]:
+    return {
+        "fixed": 0, "unchanged": 0, "no_json": 0, "no_match": 0, "no_meta": 0, "err": 0, "skip": 0,
+        "ambiguous": 0, "failed_before": 0, "no_result": 0, "failures": [],
+    }
+
+
+def _apply_batch(
+    batch: list[tuple[Path, dict[str, Any], str]],
+    zip_stats: dict[str, Any], stats: dict[str, int], store: ProgressStore, options: Options,
+) -> None:
+    """Write one batch of (target, metadata, entry key) and record each outcome."""
+    results = apply_metadata_batch(
+        [(target, metadata) for target, metadata, _ in batch], overwrite_dates=options.overwrite_dates
+    )
+    for (target, _, entry_key), result in zip(batch, results):
+        if result.status in ("written", "kept"):
+            zip_stats["fixed" if result.status == "written" else "unchanged"] += 1
+            store.record(entry_key, "done", target=target.name)
+        elif result.status == "failed":
+            zip_stats["err"] += 1
+            zip_stats["failures"].append(f"{target.name}: {result.message}")
+            store.record(entry_key, "failed", message=result.message, target=target.name)
+        else:
+            zip_stats["no_result"] += 1  # not recorded: the next run tries again
+        if result.date_kept:
+            stats["dates_kept"] += 1
+
+
+def fix_zip_entries(
+    zip_name: str,
+    entries: Sequence[tuple[int, str]],
+    json_data_map: Mapping[str, dict[str, Any]],
+    read_sidecar: Callable[[str], bytes] | None,
+    resolver: TargetResolver,
+    store: ProgressStore,
+    options: Options,
+    stats: dict[str, int],
+) -> dict[str, Any]:
+    """Match, parse and write the metadata of every media entry of one zip.
+
+    entries:       (uncompressed size, entry name) for every entry in the zip
+    json_data_map: sidecars already read, {entry name: parsed object}
+    read_sidecar:  reads one sidecar that is not in json_data_map (or None if not possible)
+
+    Returns the counters for this zip. ``no_result`` counts entries whose outcome is
+    unknown; while it is not zero the zip must not be marked completed.
+    """
+    media_entries = [(size, name) for size, name in entries if is_media(name) and not name.endswith("/")]
+    titles = {
+        name: data["title"] for name, data in json_data_map.items()
+        if isinstance(data.get("title"), str) and data["title"]
+    }
+    sidecar_index = SidecarIndex([name for _, name in entries], titles)
+    resolver.start_zip(name for _, name in media_entries)
+
+    print(f"  Processing {len(media_entries)} media files...")
+    started = time.time()
+    zip_stats = new_zip_stats()
+    batch: list[tuple[Path, dict[str, Any], str]] = []
+
+    for i, (size, media_entry) in enumerate(media_entries, 1):
+        entry_key = f"{zip_name}::{media_entry}"
+        filename = _split_entry(media_entry)[1]
+
+        if entry_key in store.processed:
+            zip_stats["skip"] += 1
+        elif entry_key in store.failed and not options.retry_failed:
+            zip_stats["failed_before"] += 1
+        elif not resolver.candidates(filename):
+            zip_stats["no_match"] += 1
+        else:
+            metadata: dict[str, Any] | None = None
+            json_entry = sidecar_index.match(media_entry)
+            if not json_entry:
+                zip_stats["no_json"] += 1
+            else:
+                json_data = json_data_map.get(json_entry)
+                raw = b""
+                if json_data is None and read_sidecar is not None:
+                    raw = read_sidecar(json_entry)  # not in the batch read: read it on its own
+                    json_data = _loads_object(raw)
+                if json_data is None and not raw:
+                    zip_stats["no_json"] += 1
+                else:
+                    metadata = parse_takeout_json(json_data)
+                    if not metadata or not build_exiftool_args(metadata, filename):
+                        zip_stats["no_meta"] += 1
+                        metadata = None
+
+            if metadata is None:
+                if not options.dry_run:
+                    store.record(entry_key, "done")
+            else:
+                target, why = resolver.resolve(entry_key, filename, size, metadata)
+                if target is None:
+                    zip_stats["ambiguous" if why == "ambiguous" else "no_match"] += 1
+                else:
+                    for key in ("datetime", "latitude", "description", "people"):
+                        if key in metadata:
+                            stats["has_gps" if key == "latitude" else f"has_{key}"] += 1
+                    resolver.claim(entry_key, target, metadata)
+                    if options.dry_run:
+                        zip_stats["fixed"] += 1
+                    else:
+                        batch.append((target, metadata, entry_key))
+                        if len(batch) >= EXIFTOOL_BATCH_SIZE:
+                            _apply_batch(batch, zip_stats, stats, store, options)
+                            batch = []
+
+        if i % 200 == 0 or i == len(media_entries):
+            elapsed = time.time() - started
+            rate = i / elapsed if elapsed > 0 else 0
+            eta = (len(media_entries) - i) / rate if rate > 0 else 0
+            print(
+                f"    [{i}/{len(media_entries)}] "
+                f"fixed={zip_stats['fixed']} no_json={zip_stats['no_json']} "
+                f"no_match={zip_stats['no_match']} skip={zip_stats['skip']} "
+                f"| {rate:.0f}/s | ETA: {format_time(eta)}",
+                flush=True,
+            )
+
+    if batch:
+        _apply_batch(batch, zip_stats, stats, store, options)
+    zip_stats["elapsed"] = time.time() - started
+    return zip_stats
+
+
+def format_zip_summary(zip_stats: dict[str, Any]) -> str:
+    """The one-line result of a zip. New counters are appended, and only when not zero."""
+    line = (
+        f"fixed={zip_stats['fixed']} no_json={zip_stats['no_json']} "
+        f"no_match={zip_stats['no_match']} skip={zip_stats['skip']} "
+        f"err={zip_stats['err']} unchanged={zip_stats['unchanged']}"
+    )
+    for key in ("ambiguous", "failed_before", "no_result"):
+        if zip_stats[key]:
+            line += f" {key}={zip_stats[key]}"
+    return line
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fix metadata on Google Takeout photos using JSON sidecars.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1214,7 +1616,12 @@ def main():
         help="Always write the sidecar date. By default a photo's embedded capture time is "
              "kept when it shows the same instant as the sidecar in another time zone"
     )
+    parser.add_argument(
+        "--retry-failed", action="store_true",
+        help="Try again the files ExifTool reported an error for in an earlier run"
+    )
     args = parser.parse_args()
+    options = Options(dry_run=args.dry_run, overwrite_dates=args.overwrite_dates, retry_failed=args.retry_failed)
 
     use_local = args.local_zips is not None
     output_dir = Path(args.output)
@@ -1242,14 +1649,11 @@ def main():
         print("ERROR: ExifTool not found on PATH!")
         sys.exit(1)
 
-    # Index output files by filename
+    # Load progress, then index the output files by name
+    store = ProgressStore(dry_run=options.dry_run)
     print(f"\nIndexing output files in {output_dir}...")
-    output_index = {}  # filename -> list of Paths
-    for f in output_dir.iterdir():
-        if f.is_file() and is_media(f.name):
-            output_index.setdefault(f.name, []).append(f)
-    total_output = sum(len(v) for v in output_index.values())
-    print(f"  {total_output} media files indexed")
+    resolver = TargetResolver(output_dir, store)
+    print(f"  {len(resolver)} media files indexed")
 
     # List zips
     if use_local:
@@ -1269,10 +1673,6 @@ def main():
         print(f"  {z}")
     print(f"  {len(zip_names)} zip(s) total")
 
-    # Load progress
-    progress = load_progress()
-    processed_set = set(progress.get("processed_entries", []))
-
     # Stats
     overall_start = time.time()
     stats = {
@@ -1288,227 +1688,101 @@ def main():
         "has_people": 0,
         "dates_kept": 0,
         "unchanged": 0,
+        "ambiguous": 0,
+        "failed_before": 0,
+        "no_result": 0,
     }
+    failures: list[str] = []
+    unfinished: list[str] = []
 
-    for zi, zip_name in enumerate(zip_names, 1):
-        if zip_name in progress.get("completed_zips", []):
-            print(f"\n[{zi}/{len(zip_names)}] SKIP (already done): {zip_name}")
-            continue
-
-        print(f"\n{'=' * 65}")
-        print(f"[{zi}/{len(zip_names)}] {zip_name}")
-        print(f"{'=' * 65}")
-
-        remote_zip = f"{args.phone_dir.rstrip('/')}/{zip_name}"
-        zip_source = str(Path(args.local_zips) / zip_name) if use_local else remote_zip
-
-        # Step 1: Get zip listing
-        print("  Listing zip contents...", end="", flush=True)
-        t = time.time()
-        if use_local:
-            entries = local_get_zip_listing(zip_source)
-        else:
-            entries = adb_get_zip_listing(remote_zip)
-        all_names = [name for _, name in entries]
-        media_entries = [name for name in all_names if is_media(name) and not name.endswith("/")]
-        json_entries = [name for name in all_names if name.endswith(".json")]
-        print(f" {len(media_entries)} media, {len(json_entries)} JSON ({time.time()-t:.1f}s)")
-
-        # Step 2: Read the JSON sidecars. Locally each one is read by name. Over ADB they
-        # arrive as one stream (a single call instead of thousands), which is then cut at
-        # the sizes from the listing.
-        sized_json = [(size, name) for size, name in entries if name.endswith(".json")]
-        print("  Streaming JSON metadata...", end="", flush=True)
-        t = time.time()
-        pairing = "name"
-        if use_local:
-            json_data_map = local_read_jsons(zip_source, json_entries)
-            json_size = sum(size for size, _ in sized_json)
-        else:
-            raw_json_bytes = adb_stream_all_jsons(remote_zip)
-            json_size = len(raw_json_bytes)
-            json_data_map, pairing = pair_json_stream(raw_json_bytes, sized_json)
-        print(f" {format_size(json_size)} ({time.time()-t:.1f}s)")
-
-        # Step 3: Report what could be parsed
-        print(f"  Parsing JSON sidecars... {len(json_data_map)}/{len(json_entries)} parsed")
-        if pairing == "none" and json_entries:
-            print("  NOTE: the sidecar stream could not be matched to the listing, so each sidecar")
-            print("        is read separately. This is slower but cannot mix sidecars up.")
-
-        # Index the listing once per zip; sidecar titles settle what names alone cannot
-        titles = {
-            json_path: data["title"] for json_path, data in json_data_map.items()
-            if isinstance(data.get("title"), str) and data["title"]
-        }
-        sidecar_index = SidecarIndex(all_names, titles)
-
-        # Step 4: Process each media file
-        print(f"  Processing {len(media_entries)} media files...")
-        zip_start = time.time()
-        exiftool_batch = []
-        zip_stats = {"fixed": 0, "unchanged": 0, "no_json": 0, "no_match": 0, "no_meta": 0, "err": 0, "skip": 0}
-        fallback_singles = []
-
-        for i, media_entry in enumerate(media_entries, 1):
-            entry_key = f"{zip_name}::{media_entry}"
-
-            # Skip already processed
-            if entry_key in processed_set:
-                zip_stats["skip"] += 1
+    try:
+        for zi, zip_name in enumerate(zip_names, 1):
+            reopen = options.retry_failed and store.has_failed(zip_name)
+            if zip_name in store.completed_zips and not reopen:
+                print(f"\n[{zi}/{len(zip_names)}] SKIP (already done): {zip_name}")
                 continue
 
-            filename = Path(media_entry).name
+            print(f"\n{'=' * 65}")
+            print(f"[{zi}/{len(zip_names)}] {zip_name}")
+            print(f"{'=' * 65}")
 
-            # Find matching output file
-            candidates = output_index.get(filename, [])
-            if not candidates:
-                # Try with _N suffix (from duplicate handling during extraction)
-                stem = Path(filename).stem
-                suffix = Path(filename).suffix
-                for n in range(1, 20):
-                    alt = f"{stem}_{n}{suffix}"
-                    if alt in output_index:
-                        candidates = output_index[alt]
-                        break
-            if not candidates:
-                zip_stats["no_match"] += 1
-                continue
+            remote_zip = f"{args.phone_dir.rstrip('/')}/{zip_name}"
+            zip_source = str(Path(args.local_zips) / zip_name) if use_local else remote_zip
 
-            # Find JSON sidecar
-            json_entry = sidecar_index.match(media_entry)
-            if not json_entry:
-                zip_stats["no_json"] += 1
-                processed_set.add(entry_key)
-                continue
-
-            # Get parsed JSON data
-            json_data = json_data_map.get(json_entry)
-            if json_data is None:
-                # Batch parsing failed for this one — queue for individual read
-                fallback_singles.append((media_entry, json_entry, candidates[0], entry_key))
-                continue
-
-            # Parse metadata
-            metadata = parse_takeout_json(json_data)
-            if not metadata:
-                zip_stats["no_meta"] += 1
-                processed_set.add(entry_key)
-                continue
-
-            # Build exiftool args
-            target = candidates[0]
-            et_args = build_exiftool_args(metadata, target)
-            if not et_args:
-                zip_stats["no_meta"] += 1
-                processed_set.add(entry_key)
-                continue
-
-            # Track stats
-            if "datetime" in metadata:
-                stats["has_datetime"] += 1
-            if "latitude" in metadata:
-                stats["has_gps"] += 1
-            if "description" in metadata:
-                stats["has_description"] += 1
-            if "people" in metadata:
-                stats["has_people"] += 1
-
-            if args.dry_run:
-                zip_stats["fixed"] += 1
-                processed_set.add(entry_key)
-                continue
-
-            exiftool_batch.append((target, metadata, entry_key))
-
-            # Run batch when full
-            if len(exiftool_batch) >= EXIFTOOL_BATCH_SIZE:
-                _flush_batch(exiftool_batch, zip_stats, stats, processed_set, args.overwrite_dates)
-                exiftool_batch = []
-
-                # Save progress periodically
-                if i % 500 == 0:
-                    progress["processed_entries"] = list(processed_set)
-                    save_progress(progress)
-
-            # Progress display
-            if i % 200 == 0 or i == len(media_entries):
-                elapsed = time.time() - zip_start
-                rate = i / elapsed if elapsed > 0 else 0
-                eta = (len(media_entries) - i) / rate if rate > 0 else 0
-                print(
-                    f"    [{i}/{len(media_entries)}] "
-                    f"fixed={zip_stats['fixed']} no_json={zip_stats['no_json']} "
-                    f"no_match={zip_stats['no_match']} skip={zip_stats['skip']} "
-                    f"| {rate:.0f}/s | ETA: {format_time(eta)}",
-                    flush=True,
-                )
-
-        # Flush remaining batch
-        if exiftool_batch:
-            _flush_batch(exiftool_batch, zip_stats, stats, processed_set, args.overwrite_dates)
-
-        # Handle fallback singles (JSONs that failed batch parsing)
-        if fallback_singles:
-            print(f"  Fetching {len(fallback_singles)} individual JSONs (fallback)...")
-            fb_batch = []
-            for _media_entry, json_entry, target, entry_key in fallback_singles:
+            # Step 1: Get zip listing. A listing that fails must not look like an empty zip.
+            print("  Listing zip contents...", end="", flush=True)
+            t = time.time()
+            try:
                 if use_local:
-                    raw = local_stream_single_json(zip_source, json_entry)
+                    entries = local_get_zip_listing(zip_source)
                 else:
-                    raw = adb_stream_single_json(remote_zip, json_entry)
-                if not raw:
-                    zip_stats["no_json"] += 1
-                    processed_set.add(entry_key)
-                    continue
-                try:
-                    data = json.loads(raw.decode("utf-8", errors="replace"))
-                except json.JSONDecodeError:
-                    zip_stats["err"] += 1
-                    processed_set.add(entry_key)
-                    continue
+                    entries = adb_get_zip_listing(remote_zip)
+                    if not entries:
+                        raise OSError("the device returned no listing (disconnected, or unzip failed)")
+            except (OSError, zipfile.BadZipFile) as exc:
+                print(f" FAILED: {exc}")
+                print("  This zip is left unfinished and will be tried again on the next run.")
+                unfinished.append(zip_name)
+                continue
+            media_count = sum(1 for _, name in entries if is_media(name) and not name.endswith("/"))
+            json_entries = [name for _, name in entries if name.endswith(".json")]
+            print(f" {media_count} media, {len(json_entries)} JSON ({time.time()-t:.1f}s)")
 
-                metadata = parse_takeout_json(data)
-                if not metadata:
-                    zip_stats["no_meta"] += 1
-                    processed_set.add(entry_key)
-                    continue
+            # Step 2: Read the JSON sidecars. Locally each one is read by name. Over ADB they
+            # arrive as one stream (a single call instead of thousands), which is then cut at
+            # the sizes from the listing.
+            sized_json = [(size, name) for size, name in entries if name.endswith(".json")]
+            print("  Streaming JSON metadata...", end="", flush=True)
+            t = time.time()
+            pairing = "name"
+            read_sidecar: Callable[[str], bytes]
+            if use_local:
+                json_data_map = local_read_jsons(zip_source, json_entries)
+                json_size = sum(size for size, _ in sized_json)
+                read_sidecar = partial(_local_read_sidecar, zip_source)
+            else:
+                raw_json_bytes = adb_stream_all_jsons(remote_zip)
+                json_size = len(raw_json_bytes)
+                json_data_map, pairing = pair_json_stream(raw_json_bytes, sized_json)
+                read_sidecar = partial(adb_stream_single_json, remote_zip)
+            print(f" {format_size(json_size)} ({time.time()-t:.1f}s)")
 
-                et_args = build_exiftool_args(metadata, target)
-                if et_args and not args.dry_run:
-                    fb_batch.append((target, metadata, entry_key))
-                else:
-                    processed_set.add(entry_key)
+            # Step 3: Report what could be parsed
+            print(f"  Parsing JSON sidecars... {len(json_data_map)}/{len(json_entries)} parsed")
+            if pairing == "none" and json_entries:
+                print("  NOTE: the sidecar stream could not be matched to the listing, so each sidecar")
+                print("        is read separately. This is slower but cannot mix sidecars up.")
 
-                if len(fb_batch) >= EXIFTOOL_BATCH_SIZE:
-                    _flush_batch(fb_batch, zip_stats, stats, processed_set, args.overwrite_dates)
-                    fb_batch = []
+            # Step 4: Process each media file
+            zip_stats = fix_zip_entries(
+                zip_name, entries, json_data_map, read_sidecar, resolver, store, options, stats
+            )
 
-            if fb_batch:
-                _flush_batch(fb_batch, zip_stats, stats, processed_set, args.overwrite_dates)
+            # A zip is finished once every entry has an outcome. Nothing is saved in a dry run,
+            # otherwise a later real run would skip every entry the dry run "processed".
+            if zip_stats["no_result"] == 0:
+                if not options.dry_run:
+                    store.complete_zip(zip_name)
+            else:
+                unfinished.append(zip_name)
+            store.checkpoint()
 
-        # Save progress (never during a dry run, otherwise a later real run
-        # would skip every entry the dry run "processed")
-        if not args.dry_run:
-            progress["processed_entries"] = list(processed_set)
-            progress.setdefault("completed_zips", []).append(zip_name)
-            save_progress(progress)
+            stats["fixed"] += zip_stats["fixed"]
+            stats["unchanged"] += zip_stats["unchanged"]
+            stats["no_json"] += zip_stats["no_json"]
+            stats["no_output_match"] += zip_stats["no_match"]
+            stats["no_metadata"] += zip_stats["no_meta"]
+            stats["errors"] += zip_stats["err"]
+            stats["already_done"] += zip_stats["skip"]
+            for key in ("ambiguous", "failed_before", "no_result"):
+                stats[key] += zip_stats[key]
+            failures.extend(zip_stats["failures"])
 
-        elapsed = time.time() - zip_start
-        stats["fixed"] += zip_stats["fixed"]
-        stats["unchanged"] += zip_stats["unchanged"]
-        stats["no_json"] += zip_stats["no_json"]
-        stats["no_output_match"] += zip_stats["no_match"]
-        stats["no_metadata"] += zip_stats["no_meta"]
-        stats["errors"] += zip_stats["err"]
-        stats["already_done"] += zip_stats["skip"]
-
-        print(
-            f"  DONE: fixed={zip_stats['fixed']} no_json={zip_stats['no_json']} "
-            f"no_match={zip_stats['no_match']} skip={zip_stats['skip']} "
-            f"err={zip_stats['err']} unchanged={zip_stats['unchanged']} ({format_time(elapsed)})"
-        )
-        sys.stdout.flush()
+            print(f"  DONE: {format_zip_summary(zip_stats)} ({format_time(zip_stats['elapsed'])})")
+            sys.stdout.flush()
+    finally:
+        # Also reached on Ctrl-C: whatever finished is kept
+        store.checkpoint()
 
     # Final summary
     elapsed = time.time() - overall_start
@@ -1522,6 +1796,12 @@ def main():
     print(f"  No matching output file:    {stats['no_output_match']}")
     print(f"  No usable metadata in JSON: {stats['no_metadata']}")
     print(f"  Errors:                     {stats['errors']}")
+    if stats["ambiguous"]:
+        print(f"  Ambiguous file, skipped:    {stats['ambiguous']}")
+    if stats["failed_before"]:
+        print(f"  Failed in an earlier run:   {stats['failed_before']}  (retry with --retry-failed)")
+    if stats["no_result"]:
+        print(f"  No result, will be retried: {stats['no_result']}")
     print("  ---")
     print(f"  With date/time:             {stats['has_datetime']}")
     print(f"  With GPS coordinates:       {stats['has_gps']}")
@@ -1530,9 +1810,24 @@ def main():
     print(f"  Dates kept (camera time):   {stats['dates_kept']}")
     print(f"{'=' * 65}")
 
+    if failures:
+        print(f"\n  ExifTool reported an error for {len(failures)} file(s):")
+        for line in failures[:20]:
+            print(f"    {line}")
+        if len(failures) > 20:
+            print(f"    ... and {len(failures) - 20} more")
+        print("  They are remembered and skipped from now on; use --retry-failed to try them again.")
+    if stats["ambiguous"]:
+        print(f"\n  {stats['ambiguous']} file(s) share a name with another photo and could not be told apart.")
+        print("  Nothing was written to them.")
+    if unfinished:
+        print(f"\n  {len(unfinished)} zip(s) were not finished and will be continued on the next run:")
+        for name in unfinished:
+            print(f"    {name}")
+
     if args.dry_run:
         print("\n  [DRY RUN] No files were modified.")
-    else:
+    elif not unfinished:
         print("\n  All done! Verify with:")
         print('  exiftool -DateTimeOriginal -CreateDate -GPSLatitude -GPSLongitude -XMP:PersonInImage "<file>"')
 
