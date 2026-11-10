@@ -94,7 +94,7 @@ Progress is kept in `fix_metadata_progress.json` in the directory you run the co
 
 ### 2. Extract media and apply metadata in one pass
 
-`extract_takeout_media.py` extracts media one file at a time into a single flat folder, renaming clashes to `name_1.jpg`, and writes dates, GPS and descriptions as it goes.
+`extract_takeout_media.py` extracts media one file at a time into a single flat folder, renaming clashes to `name_1.jpg`, and writes dates, GPS, descriptions and people tags as it goes. A photo whose sidecar is missing or unreadable is still extracted, and an interrupted run continues without duplicating files.
 
 ```bash
 python extract_takeout_media.py ./takeout-zips --output ./Output       # zips in a local folder / mounted drive
@@ -143,7 +143,7 @@ flowchart LR
 ```
 
 - **`google_takeout_metadata_fixer.py`** is the core. It holds sidecar matching (`SidecarIndex`), sidecar parsing, the date rule and ExifTool batching (`apply_metadata_batch`), target resolution (`TargetResolver`), resume state (`ProgressStore`), the ADB and local zip readers, and the main loop. The recovery helper imports these.
-- **`extract_takeout_media.py`** is a standalone extract-and-fix pipeline with its own (simpler) matcher.
+- **`extract_takeout_media.py`** extracts and fixes in one pass. It uses the same matcher, parser and writer as the fixer, stages each file inside the output folder and renames it into place when it is complete.
 - **`adb_resumable_copy.py`** pushes files to the device, skipping ones whose size already matches.
 - **`recover_takeout_zip_metadata.py`** handles zips the phone's `unzip` can't list reliably. It pushes one shell script that reads every JSON's local header and data in a single ADB call, then decompresses with `zlib` on the host.
 - **`google_photos_downloader.py`** is an optional downloader that uses the Google Photos Library API with your own OAuth client.
@@ -197,7 +197,6 @@ GitHub Actions ([`ci.yml`](.github/workflows/ci.yml)) runs ruff and mypy, the te
 - In a flat output folder, two different photos with the same file name can only be told apart by file size or by a capture time already in the file. If neither identifies them, they are reported as ambiguous and left untouched.
 - ExifTool cannot write AVI, MKV, WebM or BMP files. They are listed as errors once and then skipped.
 - Favourite status is parsed but not written to files.
-- `extract_takeout_media.py` has its own simpler matcher and doesn't write people tags. Folding it into the shared matcher is a natural next step.
 - ADB mode is exercised only through manual use. The automated tests cover local-zip mode and the pure logic.
 - Google restricted the Photos Library API's `photoslibrary.readonly` scope in 2025, so `google_photos_downloader.py` may no longer be able to list a full library. Takeout is the reliable export path.
 

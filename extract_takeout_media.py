@@ -28,230 +28,97 @@ import sys
 import tempfile
 import time
 import zipfile
-from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from google_takeout_metadata_fixer import (  # noqa: E402
+    SidecarIndex,
+    _loads_object,
+    apply_metadata_batch,
+    build_exiftool_args,
+    find_json_match,
+    is_media,
+    parse_takeout_json,
+)
 
 OUTPUT_DIR = "output"
 PROGRESS_FILE = "processing_progress.json"
 TEMP_ZIP_DIR = "_temp_zip"
-
-MEDIA_EXTENSIONS = {
-    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif",
-    ".webp", ".heic", ".heif", ".raw", ".cr2", ".nef", ".arw",
-    ".mp4", ".mov", ".avi", ".mkv", ".3gp", ".m4v", ".webm",
-}
+STAGING_PREFIX = ".gtmf-staging-"
 
 
-def is_media(name):
-    return Path(name).suffix.lower() in MEDIA_EXTENSIONS
+def _journal_path():
+    return PROGRESS_FILE + ".journal"
 
 
 def load_progress():
+    """Load the progress file, then replay the journal of entries finished since it was saved."""
+    progress: dict[str, Any] = {"completed_zips": [], "processed_files": {}}
     if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE) as f:
-            return json.load(f)
-    return {"completed_zips": [], "processed_files": {}}
+        try:
+            with open(PROGRESS_FILE, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                progress.update(loaded)
+        except (OSError, ValueError) as exc:
+            print(f"WARNING: {PROGRESS_FILE} could not be read ({exc}); starting with empty progress.")
+    if not isinstance(progress.get("processed_files"), dict):
+        progress["processed_files"] = {}
+    if not isinstance(progress.get("completed_zips"), list):
+        progress["completed_zips"] = []
+    try:
+        with open(_journal_path(), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry_key, name = json.loads(line)
+                    progress["processed_files"][entry_key] = name
+                except (ValueError, TypeError):
+                    continue  # a line cut short by a crash
+    except OSError:
+        pass
+    return progress
+
+
+def record_processed(progress, entry_key, output_name):
+    """Remember that a zip entry has been extracted, immediately and cheaply.
+
+    Rewriting the whole progress file for every photo would be far too slow, so each
+    finished entry is appended to a journal. Without this a re-run after an interrupt
+    extracted the same photos again under new names (photo_1.jpg).
+    """
+    progress.setdefault("processed_files", {})[entry_key] = output_name
+    with open(_journal_path(), "a", encoding="utf-8") as f:
+        f.write(json.dumps([entry_key, output_name]) + "\n")
 
 
 def save_progress(progress):
     for _attempt in range(5):
         try:
             tmp = PROGRESS_FILE + ".tmp"
-            with open(tmp, "w") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(progress, f, indent=2)
-            # Atomic-ish replace to avoid corruption
-            if os.path.exists(PROGRESS_FILE):
-                os.replace(tmp, PROGRESS_FILE)
-            else:
-                os.rename(tmp, PROGRESS_FILE)
-            return
+            os.replace(tmp, PROGRESS_FILE)
+            break
         except PermissionError:
             time.sleep(1)
-    # Last resort: just write directly
-    with open(PROGRESS_FILE, "w") as f:
-        json.dump(progress, f, indent=2)
+    else:
+        # Last resort: just write directly
+        with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+            json.dump(progress, f, indent=2)
+    try:
+        os.remove(_journal_path())  # everything in it is now in the progress file
+    except OSError:
+        pass
 
-
-# --- JSON sidecar matching (within a zip) ---
 
 def find_json_in_zip(nameset, media_entry):
     """Find the JSON sidecar for a media file within a zip's namelist.
 
-    Google Takeout uses 'supplemental-metadata' naming which gets truncated
-    when filenames are long. Also handles Google's duplicate naming where
-    file(2).jpg maps to file.jpg.supplemental-metadata(2).json
+    Kept for compatibility; matching is done by the shared matcher in
+    google_takeout_metadata_fixer.py.
     """
-    import re
-
-    p_media = media_entry.rsplit("/", 1)
-    parent = p_media[0] + "/" if len(p_media) > 1 else ""
-    basename = p_media[-1]
-    stem = Path(basename).stem
-
-    # New format: photo.jpg.supplemental-metadata.json
-    c = f"{media_entry}.supplemental-metadata.json"
-    if c in nameset:
-        return c
-
-    # New format with duplicate index: photo.jpg.supplemental-metadata(1).json
-    for i in range(1, 20):
-        c = f"{media_entry}.supplemental-metadata({i}).json"
-        if c in nameset:
-            return c
-
-    # Handle Google duplicate files: file(N).ext -> file.ext.supplemental-metadata(N).json
-    # e.g. MAC_ (29)(2).JPG -> MAC_ (29).JPG.supplemental-metadata(2).json
-    dup_match = re.match(r'^(.+?)\((\d+)\)(\.[^.]+)$', basename)
-    if dup_match:
-        orig_name = dup_match.group(1) + dup_match.group(3)  # e.g. MAC_ (29).JPG
-        dup_idx = dup_match.group(2)  # e.g. 2
-        orig_entry = parent + orig_name
-        # Try: original.jpg.supplemental-metadata(N).json
-        c = f"{orig_entry}.supplemental-metadata({dup_idx}).json"
-        if c in nameset:
-            return c
-        # Fallback: try base supplemental-metadata.json (same metadata for all dupes)
-        c = f"{orig_entry}.supplemental-metadata.json"
-        if c in nameset:
-            return c
-        # Fallback: try any other numbered supplemental-metadata
-        for i in range(1, 20):
-            c = f"{orig_entry}.supplemental-metadata({i}).json"
-            if c in nameset:
-                return c
-        # Try truncated version
-        prefix = f"{orig_entry}.suppl"
-        for name in nameset:
-            if name.startswith(prefix) and name.endswith(".json"):
-                return name
-
-    # Old format: photo.jpg.json
-    c = media_entry + ".json"
-    if c in nameset:
-        return c
-
-    # Old format: photo.json (stem only)
-    c = parent + stem + ".json"
-    if c in nameset:
-        return c
-
-    # Old bracket variations: photo.jpg(1).json
-    for i in range(1, 10):
-        c = f"{media_entry}({i}).json"
-        if c in nameset:
-            return c
-
-    # Truncated supplemental-metadata: match any JSON in same folder that
-    # starts with the media filename + ".suppl" (covers all truncation lengths)
-    prefix = f"{media_entry}.suppl"
-    for name in nameset:
-        if name.startswith(prefix) and name.endswith(".json"):
-            return name
-
-    # Strip -edited suffix: photo-edited.jpg -> try photo.jpg's JSON
-    edited_match = re.match(r'^(.+)-edited(\.[^.]+)$', basename, re.IGNORECASE)
-    if edited_match:
-        orig_name = edited_match.group(1) + edited_match.group(2)
-        orig_entry = parent + orig_name
-        c = f"{orig_entry}.supplemental-metadata.json"
-        if c in nameset:
-            return c
-        c = orig_entry + ".json"
-        if c in nameset:
-            return c
-        prefix = f"{orig_entry}.suppl"
-        for name in nameset:
-            if name.startswith(prefix) and name.endswith(".json"):
-                return name
-
-    # Live photo MP4: match video.mp4 -> video.jpg or video.heic JSON
-    ext_lower = Path(basename).suffix.lower()
-    if ext_lower in ('.mp4', '.mov'):
-        stem_part = Path(basename).stem
-        for photo_ext in ('.jpg', '.jpeg', '.heic', '.png', '.JPG', '.HEIC'):
-            photo_entry = parent + stem_part + photo_ext
-            c = f"{photo_entry}.supplemental-metadata.json"
-            if c in nameset:
-                return c
-            c = photo_entry + ".json"
-            if c in nameset:
-                return c
-
-    return None
-
-
-def parse_takeout_json(raw_bytes):
-    """Extract metadata from a Google Takeout JSON sidecar."""
-    data = json.loads(raw_bytes)
-    metadata = {}
-
-    # Try photoTakenTime first, fall back to creationTime
-    for time_key in ("photoTakenTime", "creationTime"):
-        if time_key in data and "datetime" not in metadata:
-            ts_str = data[time_key].get("timestamp", "0")
-            ts = int(ts_str)
-            if ts > 0:
-                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                metadata["datetime"] = dt.strftime("%Y:%m:%d %H:%M:%S")
-
-    for geo_key in ("geoData", "geoDataExif"):
-        if geo_key in data and "latitude" not in metadata:
-            geo = data[geo_key]
-            lat, lng = geo.get("latitude", 0), geo.get("longitude", 0)
-            if lat != 0 or lng != 0:
-                metadata["latitude"] = lat
-                metadata["longitude"] = lng
-                metadata["altitude"] = geo.get("altitude", 0)
-
-    if data.get("description"):
-        metadata["description"] = data["description"]
-
-    return metadata
-
-
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".3gp", ".m4v", ".webm"}
-
-
-def build_exiftool_args(metadata, filepath):
-    """Build exiftool command to write metadata."""
-    args = ["exiftool", "-overwrite_original"]
-    is_video = Path(filepath).suffix.lower() in VIDEO_EXTENSIONS
-
-    if "datetime" in metadata:
-        dt = metadata["datetime"]
-        args.extend([
-            f"-DateTimeOriginal={dt}",
-            f"-CreateDate={dt}",
-            f"-ModifyDate={dt}",
-        ])
-        if is_video:
-            args.extend([
-                f"-TrackCreateDate={dt}",
-                f"-TrackModifyDate={dt}",
-                f"-MediaCreateDate={dt}",
-                f"-MediaModifyDate={dt}",
-            ])
-
-    if "latitude" in metadata:
-        lat, lng = metadata["latitude"], metadata["longitude"]
-        args.extend([
-            f"-GPSLatitude={abs(lat)}",
-            f"-GPSLatitudeRef={'N' if lat >= 0 else 'S'}",
-            f"-GPSLongitude={abs(lng)}",
-            f"-GPSLongitudeRef={'E' if lng >= 0 else 'W'}",
-        ])
-        alt = metadata.get("altitude", 0)
-        if alt != 0:
-            args.extend([
-                f"-GPSAltitude={abs(alt)}",
-                f"-GPSAltitudeRef={0 if alt >= 0 else 1}",
-            ])
-
-    if "description" in metadata:
-        args.append(f"-ImageDescription={metadata['description']}")
-
-    args.append(str(filepath))
-    return args
+    return find_json_match(nameset, media_entry)
 
 
 # --- Output path handling ---
@@ -382,26 +249,28 @@ def adb_pull(remote_path, local_path):
 # --- Core processing ---
 
 def process_zip(zip_path, output_dir, progress, zip_index=0, total_zips=0):
-    """Process all media files in a single takeout zip, one file at a time."""
+    """Extract all media files of one takeout zip, one file at a time, and write their metadata.
+
+    Returns True when every media entry was extracted, which is when the zip may be
+    recorded as completed.
+    """
     zip_name = Path(zip_path).name
     zip_label = f"[Zip {zip_index}/{total_zips}]" if total_zips else ""
 
     try:
         zf = zipfile.ZipFile(zip_path, "r")
-    except zipfile.BadZipFile:
-        print(f"  ERROR: {zip_name} is not a valid zip file, skipping")
-        return
+    except (zipfile.BadZipFile, OSError) as exc:
+        print(f"  ERROR: {zip_name} cannot be read as a zip file ({exc}); it is left unfinished")
+        return False
 
     with zf:
         all_names = zf.namelist()
-        nameset = set(all_names)
+        sidecar_index = SidecarIndex(all_names)
         media_entries = [e for e in all_names if is_media(e) and not e.endswith("/")]
 
         # Calculate total uncompressed media size
-        media_size_total = sum(
-            info.file_size for info in zf.infolist()
-            if info.filename in set(media_entries)
-        )
+        media_set = set(media_entries)
+        media_size_total = sum(info.file_size for info in zf.infolist() if info.filename in media_set)
         print(f"  {len(media_entries)} media files ({format_size(media_size_total)}) in this zip")
         sys.stdout.flush()
 
@@ -409,6 +278,7 @@ def process_zip(zip_path, output_dir, progress, zip_index=0, total_zips=0):
         copied = 0
         errors = 0
         skipped = 0
+        not_written = 0
         bytes_done = 0
         zip_start = time.time()
 
@@ -430,40 +300,44 @@ def process_zip(zip_path, output_dir, progress, zip_index=0, total_zips=0):
 
             temp_dir = None
             try:
-                # Extract just this one media file to a temp dir
-                temp_dir = Path(tempfile.mkdtemp(prefix="gphoto_"))
+                # Stage the file inside the output folder. The last step is then a rename
+                # on the same file system, which happens completely or not at all, so an
+                # interrupt never leaves a half-written or unrecorded file in the output.
+                temp_dir = Path(tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=output_dir))
                 temp_media = temp_dir / filename
 
                 with zf.open(entry) as src, open(temp_media, "wb") as dst:
                     shutil.copyfileobj(src, dst)
 
-                # Find and parse JSON sidecar
-                json_entry = find_json_in_zip(nameset, entry)
+                # Find and parse the JSON sidecar. A sidecar that is missing or cannot be
+                # used must never cost the photo itself.
                 metadata = {}
+                json_entry = sidecar_index.match(entry)
                 if json_entry:
-                    with zf.open(json_entry) as jf:
-                        metadata = parse_takeout_json(jf.read())
+                    try:
+                        metadata = parse_takeout_json(_loads_object(zf.read(json_entry)))
+                    except (KeyError, OSError, zipfile.BadZipFile, RuntimeError):
+                        metadata = {}
 
-                # Determine output path
+                # Apply metadata with exiftool if we have any, before the file is published
+                outcome = "copied"
+                if metadata and build_exiftool_args(metadata, temp_media):
+                    result = apply_metadata_batch([(temp_media, metadata)])[0]
+                    if result.status in ("written", "kept"):
+                        outcome = "fixed"
+                    else:
+                        outcome = "not_written"
+                        print(f"    exiftool could not write {filename}: {result.message}")
+
+                # Publish under a unique name and record it
                 output_file = get_unique_output_path(output_dir, filename)
+                os.replace(temp_media, output_file)
+                record_processed(progress, entry_key, output_file.name)
 
-                # Move to output
-                shutil.move(str(temp_media), str(output_file))
-
-                # Apply metadata with exiftool if we have any
-                if metadata:
-                    args = build_exiftool_args(metadata, output_file)
-                    result = subprocess.run(args, capture_output=True, text=True, timeout=60)
-                    if result.returncode != 0 and result.stderr.strip():
-                        print(f"    exiftool warning: {filename}: {result.stderr.strip()[:100]}")
-                    fixed += 1
-                else:
-                    copied += 1
-
+                fixed += outcome == "fixed"
+                copied += outcome == "copied"
+                not_written += outcome == "not_written"
                 bytes_done += file_size
-
-                # Track progress
-                progress.setdefault("processed_files", {})[entry_key] = True
 
                 # Show live progress every 10 files or at end
                 if i % 10 == 0 or i == len(media_entries):
@@ -479,10 +353,6 @@ def process_zip(zip_path, output_dir, progress, zip_index=0, total_zips=0):
                     )
                     sys.stdout.flush()
 
-                # Save progress every 50 files
-                if i % 50 == 0:
-                    save_progress(progress)
-
             except Exception as e:
                 errors += 1
                 bytes_done += file_size
@@ -494,8 +364,14 @@ def process_zip(zip_path, output_dir, progress, zip_index=0, total_zips=0):
 
         save_progress(progress)
         elapsed = time.time() - zip_start
-        print(f"  DONE {zip_name}: {fixed} fixed, {copied} no-metadata, {errors} errors, {skipped} skipped ({format_time(elapsed)})")
+        summary = f"  DONE {zip_name}: {fixed} fixed, {copied} no-metadata, {errors} errors, {skipped} skipped"
+        if not_written:
+            summary += f", {not_written} metadata not written"
+        print(f"{summary} ({format_time(elapsed)})")
+        if errors:
+            print("  Files with errors were not extracted; this zip is left unfinished and is retried on the next run.")
         sys.stdout.flush()
+        return errors == 0
 
 
 def main():
@@ -517,7 +393,10 @@ def main():
 
     args = parser.parse_args()
     output_dir = Path(args.output)
-    output_dir.mkdir(exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # Staging folders left behind by a run that was killed hold unfinished files only
+    for stale in output_dir.glob(STAGING_PREFIX + "*"):
+        shutil.rmtree(stale, ignore_errors=True)
 
     # Check exiftool
     try:
@@ -582,8 +461,8 @@ def main():
                 continue
 
             try:
-                process_zip(local_zip, output_dir, progress, zi, len(zip_names))
-                progress.setdefault("completed_zips", []).append(zip_name)
+                if process_zip(local_zip, output_dir, progress, zi, len(zip_names)):
+                    progress.setdefault("completed_zips", []).append(zip_name)
                 save_progress(progress)
             finally:
                 # Free HDD space immediately
@@ -634,8 +513,8 @@ def main():
                 continue
 
             print(f"[{zi}/{len(zip_files)}] {zip_name}")
-            process_zip(zip_path, output_dir, progress, zi, len(zip_files))
-            progress.setdefault("completed_zips", []).append(zip_name)
+            if process_zip(zip_path, output_dir, progress, zi, len(zip_files)):
+                progress.setdefault("completed_zips", []).append(zip_name)
             save_progress(progress)
             print()
 
