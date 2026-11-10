@@ -345,6 +345,12 @@ def parse_takeout_json(data):
 # EXIFTOOL COMMAND BUILDING
 # ---------------------------------------------------------------------------
 
+def _format_number(value: float) -> str:
+    """Format a coordinate as plain decimal text (never exponent notation)."""
+    text = f"{value:.8f}".rstrip("0").rstrip(".")
+    return "0" if text in ("", "-0") else text
+
+
 def build_exiftool_args(metadata, filepath):
     """Build exiftool arguments to embed all metadata into a file."""
     args = []
@@ -367,17 +373,23 @@ def build_exiftool_args(metadata, filepath):
 
     if "latitude" in metadata:
         lat, lng = metadata["latitude"], metadata["longitude"]
+        # The value carries the sign as well as the Ref tag. EXIF stores an unsigned value
+        # plus a reference letter, but containers that only take XMP (MP4, MOV, GIF) keep
+        # the hemisphere inside the value itself, so an unsigned value would always be
+        # read back as north/east there.
         args.extend([
-            f"-GPSLatitude={abs(lat)}",
+            f"-GPSLatitude={_format_number(lat)}",
             f"-GPSLatitudeRef={'N' if lat >= 0 else 'S'}",
-            f"-GPSLongitude={abs(lng)}",
+            f"-GPSLongitude={_format_number(lng)}",
             f"-GPSLongitudeRef={'E' if lng >= 0 else 'W'}",
         ])
         alt = metadata.get("altitude", 0)
         if alt != 0:
+            # "#" writes the raw number: without it ExifTool parses "1" as text and
+            # stores 0 (above sea level).
             args.extend([
-                f"-GPSAltitude={abs(alt)}",
-                f"-GPSAltitudeRef={0 if alt >= 0 else 1}",
+                f"-GPSAltitude={_format_number(abs(alt))}",
+                f"-GPSAltitudeRef#={0 if alt >= 0 else 1}",
             ])
 
     if "description" in metadata:
