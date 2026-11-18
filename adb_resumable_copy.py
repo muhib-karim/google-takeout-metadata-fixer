@@ -7,6 +7,7 @@ command after any disconnect to resume safely.
 
 import argparse
 import os
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -16,7 +17,7 @@ def get_phone_files(dest_dir):
     """Get dict of {filename: size} for files already on phone."""
     print("Scanning phone for existing files...", flush=True)
     r = subprocess.run(
-        ["adb", "shell", f'find "{dest_dir}" -maxdepth 1 -type f -exec stat -c "%s %n" {{}} +'],
+        ["adb", "shell", f"find {shlex.quote(dest_dir)} -maxdepth 1 -type f -exec stat -c '%s %n' {{}} +"],
         capture_output=True, text=True, timeout=120
     )
     phone_files = {}
@@ -104,7 +105,7 @@ def main():
     print("  RESUMABLE ADB COPY", flush=True)
     print("=" * 60, flush=True)
 
-    subprocess.run(["adb", "shell", f'mkdir -p "{dest_dir}"'], capture_output=True, timeout=10)
+    subprocess.run(["adb", "shell", f"mkdir -p {shlex.quote(dest_dir)}"], capture_output=True, timeout=10)
 
     pc_files, pc_total = get_pc_files(source_dir)
     phone_files = get_phone_files(dest_dir)
@@ -137,7 +138,7 @@ def main():
     start_time = time.time()
 
     for i, (name, path, size) in enumerate(to_copy):
-        overall_pct = ((skipped_bytes + copied_bytes) / pc_total) * 100
+        overall_pct = ((skipped_bytes + copied_bytes) / pc_total) * 100 if pc_total else 100.0
         elapsed = time.time() - start_time
         if copied_bytes > 0 and elapsed > 0:
             speed = copied_bytes / elapsed
