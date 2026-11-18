@@ -110,3 +110,28 @@ def test_missing_phone_directory_is_an_error_not_an_empty_list(tmp_path, monkeyp
     adb.fail.add("ls")
     with pytest.raises(fixer.AdbError):
         fixer.adb_list_zips("/sdcard/Nope")
+
+
+def test_resumable_copy_quotes_dest_dir_and_handles_zero_byte_files(tmp_path, monkeypatch):
+    import adb_resumable_copy as rc
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "empty.txt").write_bytes(b"")
+    dest = '/sdcard/Out "$(id)" `uname`'
+    shell_cmds = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ["adb", "shell"]:
+            shell_cmds.append(cmd[2])
+        class R:
+            returncode = 0
+            stdout = ""
+        return R()
+
+    monkeypatch.setattr(rc.subprocess, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["prog", "--source-dir", str(src), "--dest-dir", dest])
+    rc.main()
+
+    assert shlex.split(shell_cmds[0]) == ["mkdir", "-p", dest]
+    assert shlex.split(shell_cmds[1])[:2] == ["find", dest]

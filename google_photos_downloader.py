@@ -108,7 +108,9 @@ def download_item(item, download_dir):
     resp = requests.get(download_url, timeout=120)
     resp.raise_for_status()
 
-    filepath.write_bytes(resp.content)
+    part = filepath.with_name(f".{filename}.part")
+    part.write_bytes(resp.content)
+    os.replace(part, filepath)
     return True
 
 
@@ -125,7 +127,7 @@ def main():
     download_dir.mkdir(exist_ok=True)
 
     # Count existing files
-    existing = len(list(download_dir.iterdir()))
+    existing = sum(1 for p in download_dir.iterdir() if not p.name.startswith("."))
     if existing > 0:
         print(f"Found {existing} existing files in {DOWNLOAD_DIR}/, will skip duplicates.\n")
 
@@ -135,6 +137,7 @@ def main():
     total_errors = 0
     page_token = None
     page_num = 0
+    refreshed_on_page = False
 
     while True:
         page_num += 1
@@ -142,11 +145,14 @@ def main():
 
         try:
             data = list_media_items(creds, page_token)
+            refreshed_on_page = False
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 401:
+            if e.response is not None and e.response.status_code == 401 and not refreshed_on_page:
                 print("Token expired, refreshing...")
                 creds.refresh(Request())
                 save_token(creds)
+                refreshed_on_page = True
+                page_num -= 1
                 continue
             raise
 
