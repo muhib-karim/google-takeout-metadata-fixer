@@ -3,7 +3,7 @@
 # Development tools are pinned exactly so a new release cannot change lint or test
 # results under an unrelated change. Dependabot proposes the updates.
 pytest==9.2.0
-ruff==0.17.4
+ruff==0.17.6
 mypy==2.4.1
 types-requests==2.33.0.20261030
 pip-audit==2.10.1
